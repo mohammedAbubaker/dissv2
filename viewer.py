@@ -52,14 +52,16 @@ def broadcast(gauss_batch, ray_batch):
     )
 
 
-def generate_fibonacci_sphere_rays(center, radius, n):
+def generate_fibonacci_sphere_rays(center, radius, n, jitter_scale=0.01):
     """
     Generate rays using Fibonacci sphere sampling with PyTorch vectorization.
+    Adds random jitter to ray directions for more natural variation.
 
     Args:
         center: The center point of the sphere (to tensor of shape [3])
         radius: The radius of the sphere
         n: Number of points/rays to generate
+        jitter_scale: Scale factor for jitter (0.0 = no jitter)
 
     Returns:
         ray_oris: Ray origins on the sphere surface
@@ -95,6 +97,11 @@ def generate_fibonacci_sphere_rays(center, radius, n):
 
     # Ray directions pointing outward from the center
     ray_dirs = center - ray_oris
+    
+    # Add random jitter to ray directions
+    if jitter_scale > 0:
+        jitter = to.randn_like(ray_dirs) * jitter_scale
+        ray_dirs = ray_dirs + jitter
 
     # Normalize ray directions
     ray_dirs = ray_dirs / to.linalg.norm(ray_dirs, dim=1, keepdim=True)
@@ -135,18 +142,37 @@ def compute_pairwise_great_circle(points, radius=1.0):
     # Scale by the sphere's radius if needed
     return distances * radius
 
+def compute_pairwise_euclidean(points):
+    """
+    Compute pairwise Euclidean distances for an (N,3) tensor of points.
+    """
+    # (points^2).sum(1) => shape (N,)
+    # Expand dims for row-column broadcast => shape (N,1), then (1,N)
+    sum_sq = (points**2).sum(dim=1, keepdim=True)
+    # Pairwise squared distances
+    sq_dists = sum_sq + sum_sq.T - 2.0 * (points @ points.T)
+    sq_dists = to.clamp(sq_dists, min=0.0)  # numerical stability
+    return to.sqrt(sq_dists)
 
-def compute_graph_laplacian(points, sigma, radius=1.0):
-    # Compute pairwise great circle distances
-    distances = compute_pairwise_great_circle(points, radius)
-    # Create weight matrix using a Gaussian kernel
-    W = to.exp(-(distances**2) / (2 * sigma**2))
-    # Optionally, remove self-loops by zeroing out the diagonal
-    W.fill_diagonal_(0)
-    # Compute degree matrix
+
+def compute_graph_laplacian(points, scale=5.0):
+   # Get pairwise Euclidean distances (N x N)
+    dists = compute_pairwise_euclidean(points)
+    
+    # Compute weight matrix, applying the exponential decay.
+    W = to.exp(-dists / scale)
+    
+    # Remove self connections by zeroing the diagonal.
+    n = points.shape[0]
+    eye = to.eye(n, device=points.device)
+    W = W * (1 - eye)
+    
+    # Build degree matrix D.
     D = to.diag(W.sum(dim=1))
-    # Graph Laplacian: L = D - W
+    
+    # Compute Laplacian L = D - W.
     L = D - W
+    
     return L
 
 
@@ -346,12 +372,13 @@ def get_max_responses_and_tvals(
 ):
     new_rotations = normals_to_rot_matrix(old_normals, normals)
     new_covs = new_rotations @ covs @ new_rotations.transpose(-2, -1)
-    inv_covs = to.linalg.inv(new_covs)
+    covs_reg = covs + to.eye(3, device=covs.device).unsqueeze(0).unsqueeze(0) * 1e-4
+    inv_covs = to.linalg.inv(covs_reg)
     rg_diff = means - ray_oris
     inv_cov_d = inv_covs @ ray_dirs[..., None]
     numerator = (rg_diff[:, :, None, :] @ inv_cov_d).squeeze(-1)
     denomenator = (ray_dirs[:, :, None, :] @ inv_cov_d).squeeze(-1)
-    t_values = numerator / denomenator
+    t_values = numerator / (denomenator + 1e-8)  # Increase epsilon to 1e-5 or more
     best_positions = ray_oris + t_values * ray_dirs
     max_responses = evaluate_points(best_positions, means, inv_covs, opacities)
 
@@ -363,63 +390,52 @@ class GaussianParameters(nn.Module):
         super(GaussianParameters, self).__init__()
         self.gaussian_model = GaussianModel(path)
         self.means = nn.Parameter(self.gaussian_model.means)
-        self.normals = nn.Parameter(self.gaussian_model.normals)
+        self.normals = self.gaussian_model.normals
         ray_oris, ray_dirs = generate_fibonacci_sphere_rays(
             to.tensor([0.0, 0.0, 0.0]), 1, 20000
         )
         self.ray_oris = ray_oris.to(device)
         self.ray_dirs = ray_dirs.to(device)
-        self.laplacian = compute_graph_laplacian(ray_oris, 1, 10).to(device)
-        self.spatial_hash_ext = None
+        self.laplacian = compute_graph_laplacian(ray_oris).to(device)
 
     def forward(self):
-        return self.means, self.normals
-
-    def get_spatial_index(self, positions, spatial_args):
-        x_idxs = (
-            (positions[..., 0] - spatial_args["min_corner"][0])
-            / spatial_args["spacings"][0]
-        ).int()
-        y_idxs = (
-            (positions[..., 1] - spatial_args["min_corner"][1])
-            / spatial_args["spacings"][1]
-        ).int()
-        z_idxs = (
-            (positions[..., 2] - spatial_args["min_corner"][2])
-            / spatial_args["spacings"][2]
-        ).int()
-
-        x_idxs = to.clip(x_idxs, 0, spatial_args["n_x"] - 1)
-        y_idxs = to.clip(y_idxs, 0, spatial_args["n_y"] - 1)
-        z_idxs = to.clip(z_idxs, 0, spatial_args["n_z"] - 1)
-
-        return x_idxs.squeeze(), y_idxs.squeeze(), z_idxs.squeeze()
+        return self.means
+    
     def create_bounding_boxes(self):
         unit_cube = to.tensor(
             [
                 [1.0, 1.0, 1.0],
-                [1.0, 1.0, -1.0],
-                [1.0, -1.0, 1.0],
-                [1.0, -1.0, -1.0],
-                [-1.0, 1.0, 1.0],
-                [-1.0, 1.0, -1.0],
-                [-1.0, -1.0, 1.0],
                 [-1.0, -1.0, -1.0],
-            ], device=device
+            ],
+            device=device,
         )
-        
-        # Shape: (N, 8, 3)
-        scaled_vertices = self.gaussian_model.scales_exp[:, None, :] * unit_cube[None, :, :]
-        # Rotations: (N, 3, 3)
-        # scaled_vertices.transpose(0, 2, 1): (N, 3, 8)
-        # Multiply => (N, 3, 8)
-        # Then transpose back => (N, 8, 3)
-        rotated_vertices = (self.gaussian_model.rotations @ scaled_vertices.transpose(-1, -2)).transpose(-1, -2)
 
-        # Finally translate by the means: shape (N, 3) => broadcast to (N, 8, 3)
+        # Shape: (N, 2, 3)
+        scaled_vertices = (
+            self.gaussian_model.scales_exp[:, None, :] * unit_cube[None, :, :]
+        )
+        '''
+        new_rotations = normals_to_rot_matrix(
+            self.gaussian_model.reference_normals[None,
+                                                  :], self.normals[None, :]
+        )
+        new_rotations = new_rotations.squeeze(0)
+        '''
+        # Expand rotations to match the number of vertices (2)
+        rotation_expanded = self.gaussian_model.rotations.unsqueeze(
+            1)  # [N, 1, 3, 3]
+        # [N, 2, 3, 3]
+
+        rotation_expanded = rotation_expanded.expand(-1, 2, -1, -1)
+
+        # Now do the matrix multiplication
+        rotated_vertices = (
+            rotation_expanded @ scaled_vertices[..., None]
+        )  # [N, 2, 3, 1]
+        rotated_vertices = rotated_vertices.squeeze(-1)  # [N, 2, 3]
+
+        # Finally translate
         translated = rotated_vertices + self.means[:, None, :]
-
-        # Return the minimum and maximum corners of the bounding boxes as (N, 3) tensors
         return translated.min(dim=1).values, translated.max(dim=1).values
     
     def get_top_16(self):
@@ -535,7 +551,7 @@ class GaussianParameters(nn.Module):
             self.gaussian_model.covariances[ray_gaussian_indices],
             self.ray_dirs[ray_idx, None, None, :],
             self.gaussian_model.opacities[ray_gaussian_indices],
-            self.normals[ray_gaussian_indices],
+            self.gaussian_model.reference_normals[ray_gaussian_indices],
             self.gaussian_model.reference_normals[ray_gaussian_indices],
         )
 
@@ -1011,132 +1027,40 @@ class GaussianParameters(nn.Module):
         shifted[:, 1:] = transmittance[:, :-1]
         # Calculate contribution
         sorted_contribution = shifted - transmittance
-        # Normalise
-        norm_factor = to.sum(sorted_contribution, dim=1)[..., None]
-        sorted_contribution = sorted_contribution / norm_factor
         # unsort the contribution
         inv_idx = sorted_idx.argsort(dim=1)
         # Reorder contribution back to the original order:
         contribution = sorted_contribution.gather(dim=1, index=inv_idx)
         blended_tvals = to.sum(contribution * tvals, dim=1)
         return blended_tvals
-
-    def project_spatial(self):
-        spatial_args = self.get_spatial_args()
-        # First, we compute hashes for all our Gaussians.
-        gx_idxs, gy_idxs, gz_idxs = self.get_spatial_index(
-            self.means[None, ...], spatial_args
-        )
-        g_hashes = self.get_spatial_hashes(
-            gx_idxs, gy_idxs, gz_idxs, spatial_args)
-        hash_bins = to.bincount(g_hashes)
-
-        H = spatial_args["num_cells"]
-        B = to.max(hash_bins)
-        unique_hashes, inverse_indices, counts = to.unique(
-            g_hashes, return_inverse=True, return_counts=True
-        )
-
-        # GPU Scatter? For now let's keep it as a plain for loop.
-        grouped_indices = {
-            h: to.where(inverse_indices == i)[0] for i, h in enumerate(unique_hashes)
-        }
-        hash_to_g = to.full((H, B), -1, dtype=to.int, device=device)
-        for i, h in enumerate(grouped_indices.keys()):
-            indices = grouped_indices[h]
-            hash_to_g[i, : len(indices)] = indices
-
-        t_nears, t_fars = self.ray_box_intersections(spatial_args)
-        # Optimized vectorized linspace entirely on GPU.
-        steps = 10
-        linspace_base = to.linspace(
-            0, 1, steps, device=device)  # shape: (steps,)
-        sample_t_vals = (
-            t_nears[:, None] + (t_fars - t_nears)[:, None] *
-            linspace_base[None, :]
-        )
-
-        points_of_query = (
-            self.ray_oris[:, None, :]
-            + self.ray_dirs[:, None, :] * sample_t_vals[..., None]
-        )
-        rx_idxs, ry_idxs, rz_idxs = self.get_spatial_index(
-            points_of_query, spatial_args
-        )
-        ray_hashes = self.get_spatial_hashes(
-            rx_idxs, ry_idxs, rz_idxs, spatial_args)
-        ray_gauss_indices = hash_to_g[ray_hashes.long()].long()
-        return self.blend_tvals(ray_gauss_indices, points_of_query)
-
-    def get_spatial_args(self):
-        spatial_args = {
-            "n_x": 10,
-            "n_y": 10,
-            "n_z": 10,
-            "max_corner": to.tensor(
-                [
-                    self.means[:, 0].max(),
-                    self.means[:, 1].max(),
-                    self.means[:, 2].max(),
-                ],
-                device=device,
-            ),
-            "min_corner": to.tensor(
-                [
-                    self.means[:, 0].min(),
-                    self.means[:, 1].min(),
-                    self.means[:, 2].min(),
-                ],
-                device=device,
-            ),
-        }
-        spatial_args["num_cells"] = (
-            spatial_args["n_x"] * spatial_args["n_y"] * spatial_args["n_z"]
-        )
-        spatial_args["spacings"] = (
-            spatial_args["max_corner"] - spatial_args["min_corner"]
-        ) / to.tensor(
-            [spatial_args["n_x"], spatial_args["n_y"], spatial_args["n_z"]],
-            device=device,
-        )
-
-        return spatial_args
-    def harmonic_loss_optimized(self):
-        # Get spatial grid parameters
-        spatial_args = self.get_spatial_args()
-        min_corner = spatial_args["min_corner"]
-        grid_dims = to.tensor([spatial_args["n_x"], spatial_args["n_y"], spatial_args["n_z"]], device=device)
-        spacings = spatial_args["spacings"]
-        
-        # Call optimized projection function
-        projected_values = self.project_optimized(
-            self.ray_oris,
-            self.means,
-            self.gaussian_model.covariances,
-            self.ray_dirs,
-            self.gaussian_model.opacities,
-            self.normals,
-            self.gaussian_model.reference_normals,
-            min_corner,
-            grid_dims,
-            spacings
-        )
-        
-        # Calculate harmonic loss
-        loss = projected_values.T @ self.laplacian @ projected_values
-        return loss
+    
     def harmonic_loss(self):
-        projected_values = self.project(
-            self.ray_oris,
-            self.means,
-            self.gaussian_model.covariances,
-            self.ray_dirs,
-            self.gaussian_model.opacities,
-            self.normals,
-            self.gaussian_model.normals,
+        # Compute the current projection of t-values.
+        blended_t_vals = self.project()
+        if to.isnan(blended_t_vals).any() or to.isinf(blended_t_vals).any():
+            raise ValueError("NaN or Inf detected in blended_t_vals")
+
+        # Define hyperparameters.
+        feature_factor = 0.03
+        # Compute feature loss using the Laplacian quadratic form.
+        feature_loss = feature_factor * (
+            blended_t_vals.T @ self.laplacian @ blended_t_vals
         )
-        loss = projected_values.T @ self.laplacian @ projected_values
-        return loss
+        
+        '''
+        # Set up and solve the implicit update: (I + dt*dampening_factor*L) * f_new = f_prev.
+        I = to.eye(self.laplacian.shape[0], device=self.laplacian.device)
+        A = I + dt * dampening_factor * self.laplacian
+        f_new = to.linalg.solve(A, self.f_prev)
+
+        # Compute the implicit loss as the squared difference between the projection and the implicit update.
+        implicit_loss = to.sum((blended_t_vals - f_new) ** 2)
+
+        # Update f_prev for the next iteration without detaching f_new.
+        self.f_prev = f_new.detach()
+        '''
+        # Return the total loss combining implicit and feature losses.
+        return feature_loss
 
 
 class RenderContext:
@@ -1388,12 +1312,56 @@ def save_optimized_gaussian_model(model, output_path="optimized_point_cloud.ply"
     ply_element = PlyElement.describe(new_data, "vertex")
     PlyData([ply_element], text=False).write(output_path)
 
+import threading
+def visualize_depth_updates(model, update_interval=0.1):
+    """
+    Visualize the current depth values by plotting the points
+    computed as: ray_ori + (depth * ray_dir)
+    using Vispy. This function updates every 'update_interval'
+    seconds.
+    """
+    from vispy import scene, app
+    import numpy as np
+    import torch as to
 
-def train_model(model, num_iterations=1000, lr=0.005):
+    # Set up the canvas and view.
+    canvas = scene.SceneCanvas(keys="interactive", bgcolor="black")
+    view = canvas.central_widget.add_view()
+    
+    # Create a markers visual for the projected points.
+    scatter = scene.visuals.Markers(parent=view.scene)
+    # Initialize with the ray origins to avoid None data.
+    initial_points = model.ray_oris.detach().cpu().numpy() + model.f_prev.detach().cpu().numpy() * model.ray_dirs.detach().cpu().numpy()
+    scatter.set_data(initial_points, face_color='red', size=8)
+
+    # Update function called every timer tick.
+    def update(event):
+        # Compute new positions as: ray_ori + (depth * ray_dir)     
+        new_points = model.ray_oris.detach().cpu().numpy() + model.f_prev.detach().cpu().numpy() * model.ray_dirs.detach().cpu().numpy()
+        # Update scatter data.
+        scatter.set_data(new_points, face_color='red', size=8)
+        canvas.update()
+
+    # Set up a timer to update the visualization periodically.
+    timer = app.Timer(interval=update_interval, connect=update, start=True)
+
+    view.camera = scene.cameras.TurntableCamera()
+    view.camera.set_range()
+    
+    canvas.show()
+    app.run()
+def start_visualization(model, update_interval=0.1):
+    visualize_depth_updates(model, update_interval=update_interval)
+
+def train_model(model, num_iterations=1000, lr=0.001):
     optimizer = to.optim.Adam(model.parameters(), lr=lr)
+    model.f_prev = model.project().detach()
+    print
+    vis_thread = threading.Thread(target=start_visualization, args=(model,))
+    vis_thread.start()
     for iteration in tqdm(range(num_iterations)):
         optimizer.zero_grad()
-        loss = model.harmonic_loss_optimized()
+        loss = model.harmonic_loss()
         loss.backward()
         optimizer.step()
     save_optimized_gaussian_model(
@@ -1402,11 +1370,6 @@ def train_model(model, num_iterations=1000, lr=0.005):
 
 if __name__ == "__main__":
     model = GaussianParameters("point_cloud.ply")
-    # train_model(model=model, num_iterations=10)
+    train_model(model=model, num_iterations=100)
     # Get spatial grid parameters
     # Call optimized projection function
-    projected_values = model.project()
-    context = RenderContext()
-    positions = model.ray_oris + model.ray_dirs * projected_values
-    context.update(positions.detach().cpu().numpy(), projected_values.detach().cpu().numpy())
-    app.run()
