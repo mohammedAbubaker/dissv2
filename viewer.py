@@ -1,3 +1,5 @@
+import threading
+import cupy as cp
 import time
 from plyfile import PlyData, PlyElement
 import torch.autograd.profiler as profiler
@@ -15,44 +17,31 @@ from blank import kernel_code
 
 device = "cuda"
 
-import cupy as cp
+
 module = cp.RawModule(code=kernel_code)
 kernel = module.get_function("ray_aabb_intersect_top16")
-def broadcast(gauss_batch, ray_batch):
-    # Split up gauss_batch
-    means, covariances, opacities, normals, reference_normals = gauss_batch
-    # Split up ray_batch
-    ray_oris, ray_dirs = ray_batch
 
-    R = ray_oris.shape[0]
-    G = means.shape[0]
+def generate_rays_from_points(points, radius, keep_percentage=0.2                              ):
+    # Sample a subset of points if keep_percentage < 1.0
+    num_points = points.shape[0]
+    num_keep = int(num_points * keep_percentage)
+    # Randomly permute and select
+    indices = to.randperm(num_points)[:num_keep]
+    selected_points = points[indices]
 
-    bcast_ray_oris = ray_oris.unsqueeze(1)
-    # (N_, dim=1rays, 1, 3)
-    bcast_ray_dirs = ray_dirs.unsqueeze(1)
-    # (1, N_gaussians, 3)
-    bcast_means = means.unsqueeze(0)
-    # (1, N_gaussians, 3)
-    bcast_covariances = covariances.unsqueeze(0)
-    # (1, N_gaussians)
-    bcast_opacities = opacities.unsqueeze(0)
-    # (1, N_gaussians, 3)
-    bcast_normals = normals.unsqueeze(0)
-    # (1, N_gaussians, 3)
-    bcast_reference_normals = reference_normals.unsqueeze(0)
+    # Compute the center of the selected points
+    center = selected_points.mean(dim=0)
 
-    return (
-        bcast_means,
-        bcast_covariances,
-        bcast_opacities,
-        bcast_normals,
-        bcast_reference_normals,
-        bcast_ray_oris,
-        bcast_ray_dirs,
-    )
+    # Generate ray directions from the center to the selected points
+    ray_dirs = selected_points - center
+    ray_dirs = ray_dirs / to.linalg.norm(ray_dirs, dim=1, keepdim=True)
+
+    # Compute ray origins
+    ray_oris = center + ray_dirs * radius
+    return ray_oris, -1.0 * ray_dirs
 
 
-def generate_fibonacci_sphere_rays(center, radius, n, jitter_scale=0.01):
+def generate_fibonacci_sphere_rays(center, radius, n, jitter_scale=0.03):
     """
     Generate rays using Fibonacci sphere sampling with PyTorch vectorization.
     Adds random jitter to ray directions for more natural variation.
@@ -97,7 +86,7 @@ def generate_fibonacci_sphere_rays(center, radius, n, jitter_scale=0.01):
 
     # Ray directions pointing outward from the center
     ray_dirs = center - ray_oris
-    
+
     # Add random jitter to ray directions
     if jitter_scale > 0:
         jitter = to.randn_like(ray_dirs) * jitter_scale
@@ -142,6 +131,7 @@ def compute_pairwise_great_circle(points, radius=1.0):
     # Scale by the sphere's radius if needed
     return distances * radius
 
+
 def compute_pairwise_euclidean(points):
     """
     Compute pairwise Euclidean distances for an (N,3) tensor of points.
@@ -153,28 +143,135 @@ def compute_pairwise_euclidean(points):
     sq_dists = sum_sq + sum_sq.T - 2.0 * (points @ points.T)
     sq_dists = to.clamp(sq_dists, min=0.0)  # numerical stability
     return to.sqrt(sq_dists)
+import torch.nn.functional as F
 
 
-def compute_graph_laplacian(points, scale=5.0):
-   # Get pairwise Euclidean distances (N x N)
-    dists = compute_pairwise_euclidean(points)
-    
-    # Compute weight matrix, applying the exponential decay.
-    W = to.exp(-dists / scale)
-    
-    # Remove self connections by zeroing the diagonal.
-    n = points.shape[0]
-    eye = to.eye(n, device=points.device)
-    W = W * (1 - eye)
-    
-    # Build degree matrix D.
-    D = to.diag(W.sum(dim=1))
-    
-    # Compute Laplacian L = D - W.
-    L = D - W
-    
-    return L
 
+def based_v2_loss(points, predicted_depth_vals, ground_truth_depth_vals, lambda_laplacian=0.2):
+    """
+    Computes the total loss as a combination of fidelity loss (e.g., MSE)
+    and the Laplacian (smoothness) loss.
+    
+    predicted_depth_vals: Predicted depth values, tensor of shape [N, 1] or [N]
+    ground_truth_depth_vals: Ground truth depth values, tensor of shape [N] (or [N, 1])
+    lambda_laplacian: Weighting factor for the Laplacian loss.
+    """
+    # Data fidelity loss: mean squared error between predicted and ground truth depth\
+
+
+    # fidelity_loss = F.mse_loss(predicted_depth_vals.squeeze(), ground_truth_depth_vals)
+    fidelity_loss = 0
+    # Laplacian smoothness loss
+    laplacian_loss = compute_graph_laplacian_loss(points, predicted_depth_vals)
+    
+    # Total loss: combine both terms
+    total_loss = fidelity_loss + lambda_laplacian * laplacian_loss
+    return total_loss
+
+
+def compute_graph_laplacian_loss(points, depth_vals):
+    distances = to.cdist(points, points) 
+    get_top_16_distances, get_top_16_indices = distances.topk(16, 1, largest=False)  # Get top 16 neighbors
+    
+    # Compute weights inversely proportional to distance, and normalize (using L2 norm here)
+    weights = 1 / (get_top_16_distances + 1e-4)
+    weights = weights / to.norm(weights, dim=1, keepdim=True)
+    
+    # Compute the weighted average of neighbors' depth values
+    neighbour_average = to.sum(weights * depth_vals[get_top_16_indices], dim=1)
+    
+    # Laplacian loss: squared difference between each depth value and its neighbors' average
+    loss = to.sum((depth_vals - neighbour_average) ** 2)
+    return loss
+
+    
+def compute_weighted_neighbors(points):
+    # Compute pairwise distances (assuming compute_pairwise_euclidean exists)
+    distances = compute_pairwise_euclidean(points)  # shape: [N, N]
+    # Get indices of 16 nearest neighbors for each point (ignoring self if needed)
+    get_top_16_distances, get_top_16_indices = distances.topk(16, dim=1, largest=False)
+    # Compute weights inversely proportional to distance
+    weights = 1 / (get_top_16_distances + 1e-4)
+    # Normalize weights to sum to 1 for each point (L1 normalization)
+    weights = weights / weights.sum(dim=1, keepdim=True)
+    return get_top_16_indices, weights
+
+def build_operator_matrix(num_points, top_indices, weights, dt):
+    """
+    Constructs the matrix A = I + dt * (I - W)
+    where W is defined through the provided top_indices and weights.
+    """
+    # We'll collect row indices, col indices, and corresponding values
+    rows, cols, vals = [], [], []
+    
+    # Diagonal entries: for each point, we have A_ii = 1 + dt.
+    for i in range(num_points):
+        rows.append(i)
+        cols.append(i)
+        vals.append(1.0 + dt)
+    
+    # Off-diagonals: for each point i and each neighbor j,
+    # A_ij = -dt * weight_ij.
+    for i in range(num_points):
+        for k in range(top_indices.shape[1]):
+            j = top_indices[i, k].item()
+            w_ij = weights[i, k].item()
+            rows.append(i)
+            cols.append(j)
+            vals.append(- dt * w_ij)
+    
+    # Build a sparse tensor A of shape [num_points, num_points]
+    indices = to.tensor([rows, cols], dtype=to.long)
+    values = to.tensor(vals, dtype=to.float32)
+    A_sparse = to.sparse_coo_tensor(indices, values=values, size=(num_points, num_points)) 
+
+    return A_sparse
+
+
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+
+def backward_euler_update(points, depth_vals, dt):
+    """
+    Performs one backward Euler update for depth_vals using a sparse solver
+    that preserves the computation graph for backpropagation.
+
+    depth_vals: tensor of shape [N] or [N, 1]
+    dt: time step (scalar)
+    """
+    # Ensure depth_vals is of shape [N]
+    num_points = depth_vals.shape[0]
+    depth_vals = depth_vals.reshape(-1)
+
+    # Compute neighbor indices and weights from points (graph remains fixed)
+    top_indices, weights = compute_weighted_neighbors(points)
+
+    # Build sparse system matrix A = I + dt * (I - W)
+    A_sparse = build_operator_matrix(num_points, top_indices, weights, dt).to(device=device)
+    # Use conjugate gradient method to solve the system Ax = b while preserving gradients
+    def mv(v):
+        """Matrix-vector product using sparse matrix"""
+        return to.sparse.mm(A_sparse, v.unsqueeze(1)).squeeze(1)
+    
+    # Initial guess and residual
+    x = to.zeros_like(depth_vals)
+    r = depth_vals - mv(x)
+    p = r.clone()
+    rsold = to.dot(r, r)
+    
+    # Conjugate gradient iterations
+    for i in range(min(100, num_points)):
+        Ap = mv(p)
+        alpha = rsold / (to.dot(p, Ap) + 1e-10)
+        x = x + alpha * p
+        r = r - alpha * Ap
+        rsnew = to.dot(r, r)
+        if to.sqrt(rsnew) < 1e-8:
+            break
+        p = r + (rsnew / (rsold + 1e-10)) * p
+        rsold = rsnew
+    
+    return x
 
 def quaternion_to_rotation_matrix(quaternions):
     x = quaternions[:, 1]
@@ -259,8 +356,16 @@ class GaussianModel:
         self.normals[flip_mask] = -self.normals[flip_mask]
         self.reference_normals = self.normals
 
-
 def evaluate_points(points, gaussian_means, gaussian_inv_covs, gaussian_opacities):
+    distance_to_mean = points - gaussian_means
+    exponent = -0.5 * (
+        distance_to_mean[:, :, None, :] @ gaussian_inv_covs @ distance_to_mean[..., None]
+    ).squeeze(-1)
+    exponent = to.clamp(exponent, min=-50, max=50)
+    evaluations = gaussian_opacities * to.exp(exponent)
+    return evaluations
+
+def evaluate_points_2(points, gaussian_means, gaussian_inv_covs, gaussian_opacities):
     distance_to_mean = points - gaussian_means
     exponent = -0.5 * (
         distance_to_mean[:, :, None, :]
@@ -270,14 +375,22 @@ def evaluate_points(points, gaussian_means, gaussian_inv_covs, gaussian_opacitie
     evaluations = gaussian_opacities * to.exp(exponent).squeeze(-1)
     return evaluations
 
-
 def skew_symmetric(v):
-    row1 = to.stack([to.zeros_like(v[..., 0]), -v[..., 2], v[..., 1]], dim=-1)
-    row2 = to.stack([v[..., 2], to.zeros_like(v[..., 1]), -v[..., 0]], dim=-1)
-    row3 = to.stack([-v[..., 1], v[..., 0], to.zeros_like(v[..., 2])], dim=-1)
-    K = to.stack([row1, row2, row3], dim=-2)
+    """
+    v: shape (..., 3)
+    Returns: shape (..., 3, 3)
+    """
+    # Each row of v is (vx, vy, vz)
+    # K = [[ 0, -vz,  vy],
+    #      [ vz,  0, -vx],
+    #      [-vy, vx,   0]]
+    zero = to.zeros_like(v[..., 0])
+    K = to.stack([
+        to.stack([zero,         -v[..., 2],  v[..., 1]], dim=-1),
+        to.stack([v[..., 2],    zero,       -v[..., 0]], dim=-1),
+        to.stack([-v[..., 1],   v[..., 0],   zero      ], dim=-1),
+    ], dim=-2)
     return K
-
 
 def normals_to_rot_matrix_2(a, b):
     # a and b are assumed to be unit vectors (with shape [..., 3])
@@ -353,32 +466,76 @@ def quaternion_multiply(q, r):
 
 
 def normals_to_rot_matrix(a, b):
-    # Given 2 RxNx3 vectors a and b, return an RxNx3x3 rotation matrix
-    a_dot_b = (a[:, :, None, :] @ b[..., None]).squeeze(-1).squeeze(-1)
-    a_norm = to.linalg.norm(a)
-    b_norm = to.linalg.norm(b, dim=2)
-    angle = to.acos((a_dot_b / (a_norm * b_norm)))
-    v = to.cross(a, b)
-    s = to.norm(v, dim=2) * to.sin(angle)
-    c = a_dot_b * to.cos(angle)
-    i = to.eye(3).to(device="cuda").tile(a.shape[0], a.shape[1], 1, 1)
-    v_skew = skew_symmetric(v)
-    last_term = 1 / (1 + c)
-    return i + v_skew + (v_skew @ v_skew) * last_term[..., None, None]
+    """
+    a, b: shape (R, N, 3) or (N, 3) or (any_batch, 3)
+        Each [i,j,:] is a normal vector. 
+    Returns: shape (R, N, 3, 3) or matching batch shape + (3,3).
+            Rotation matrices that rotate each a[i,j] onto b[i,j].
+    """
+    # 1) Normalize
+    a_norm = to.norm(a, dim=-1, keepdim=True)
+    b_norm = to.norm(b, dim=-1, keepdim=True)
+    a_unit = a / (a_norm + 1e-8)
+    b_unit = b / (b_norm + 1e-8)
 
+    # 2) Dot product => cos(theta)
+    dot_ab = (a_unit * b_unit).sum(dim=-1).clamp(-1.0, 1.0)
+    theta = to.acos(dot_ab)  # shape (R, N) or batch
 
-def get_max_responses_and_tvals(
+    # 3) Rotation axis = cross(a, b) (unnormalized), then normalize
+    axis = to.cross(a_unit, b_unit, dim=-1)
+    axis_len = to.norm(axis, dim=-1, keepdim=True) + 1e-8
+    axis_unit = axis / axis_len
+
+    # 4) Build skew-symmetric matrix K of shape (..., 3, 3)
+    K = skew_symmetric(axis_unit)
+
+    # 5) Rodrigues formula: R = I + sin(theta)*K + (1 - cos(theta))*K^2
+    sin_t = to.sin(theta)[..., None, None]  # shape (..., 1, 1)
+    cos_t = to.cos(theta)[..., None, None]
+    I = to.eye(3, device=a.device).expand(K.shape)  # same batch shape + (3, 3)
+
+    K2 = K @ K
+    R = I + sin_t * K + (1.0 - cos_t) * K2
+
+    # Special case: if a and b are nearly collinear, cross(a,b) ~ 0 => axis is undefined.
+    # This formula still works if a ≈ b (axis=0 => K=0 => R=I).
+    # But if a ≈ -b, you get 180° rotation; handle that if needed.
+
+    return R
+def get_max_responses_and_tvals(ray_oris, means, covs, ray_dirs, opacities, normals, old_normals):
+    new_rotations = normals_to_rot_matrix(old_normals, normals)
+    new_covs = new_rotations @ covs @ new_rotations.transpose(-2, -1)
+    covs_reg = covs + to.eye(3, device=covs.device).unsqueeze(0).unsqueeze(0) * 1e-3
+
+    inv_covs = to.linalg.inv(new_covs)
+    rg_diff = means - ray_oris
+    inv_cov_d = inv_covs @ ray_dirs[..., None]
+    numerator = (rg_diff[:, :, None, :] @ inv_cov_d).squeeze(-1)
+    denominator = (ray_dirs[:, :, None, :] @ inv_cov_d).squeeze(-1)
+    # Increase epsilon to avoid unstable division
+    t_values = numerator / (denominator + 1e-5)
+    t_values = to.clamp(t_values, -1000.0, 1000.0)
+    best_positions = ray_oris + t_values * ray_dirs
+    max_responses = evaluate_points(best_positions, means, inv_covs, opacities)
+
+    return max_responses, t_values
+
+def get_max_responses_and_tvals_2(
     ray_oris, means, covs, ray_dirs, opacities, normals, old_normals
 ):
     new_rotations = normals_to_rot_matrix(old_normals, normals)
     new_covs = new_rotations @ covs @ new_rotations.transpose(-2, -1)
-    covs_reg = covs + to.eye(3, device=covs.device).unsqueeze(0).unsqueeze(0) * 1e-4
-    inv_covs = to.linalg.inv(covs_reg)
+    covs_reg = covs + to.eye(3, device=covs.device).unsqueeze(0).unsqueeze(0) * 1e-3  # Increase regularization
+
+    inv_covs = to.linalg.inv(new_covs)
     rg_diff = means - ray_oris
     inv_cov_d = inv_covs @ ray_dirs[..., None]
     numerator = (rg_diff[:, :, None, :] @ inv_cov_d).squeeze(-1)
     denomenator = (ray_dirs[:, :, None, :] @ inv_cov_d).squeeze(-1)
-    t_values = numerator / (denomenator + 1e-8)  # Increase epsilon to 1e-5 or more
+    # Increase epsilon to 1e-5 or more
+    t_values = numerator / (denomenator + 1e-5)
+    t_values = to.clamp(t_values, -1000.0, 1000.0)
     best_positions = ray_oris + t_values * ray_dirs
     max_responses = evaluate_points(best_positions, means, inv_covs, opacities)
 
@@ -390,17 +547,22 @@ class GaussianParameters(nn.Module):
         super(GaussianParameters, self).__init__()
         self.gaussian_model = GaussianModel(path)
         self.means = nn.Parameter(self.gaussian_model.means)
-        self.normals = self.gaussian_model.normals
-        ray_oris, ray_dirs = generate_fibonacci_sphere_rays(
-            to.tensor([0.0, 0.0, 0.0]), 1, 20000
-        )
-        self.ray_oris = ray_oris.to(device)
-        self.ray_dirs = ray_dirs.to(device)
-        self.laplacian = compute_graph_laplacian(ray_oris).to(device)
+        self.normals = nn.Parameter(self.gaussian_model.normals)
+        self.ray_oris, self.ray_dirs = generate_rays_from_points(self.means, 2.0)
+    def based_2(self):
+        depth_values = self.project_2().squeeze() 
+        predicted_depth_values = backward_euler_update(self.ray_oris, depth_values, 0.1)  
+        fidelity_loss = 0
+        lambda_laplacian = 5
+        # Laplacian smoothness loss
+        laplacian_loss = compute_graph_laplacian_loss(self.ray_oris, predicted_depth_values)
+        
+        # Total loss: combine both terms
+        return laplacian_loss
 
     def forward(self):
-        return self.means
-    
+        return self.means, self.normals
+
     def create_bounding_boxes(self):
         unit_cube = to.tensor(
             [
@@ -414,13 +576,13 @@ class GaussianParameters(nn.Module):
         scaled_vertices = (
             self.gaussian_model.scales_exp[:, None, :] * unit_cube[None, :, :]
         )
-        '''
+        """
         new_rotations = normals_to_rot_matrix(
             self.gaussian_model.reference_normals[None,
-                                                  :], self.normals[None, :]
+                                                :], self.normals[None, :]
         )
         new_rotations = new_rotations.squeeze(0)
-        '''
+        """
         # Expand rotations to match the number of vertices (2)
         rotation_expanded = self.gaussian_model.rotations.unsqueeze(
             1)  # [N, 1, 3, 3]
@@ -432,38 +594,53 @@ class GaussianParameters(nn.Module):
         rotated_vertices = (
             rotation_expanded @ scaled_vertices[..., None]
         )  # [N, 2, 3, 1]
+
+        new_rotations = normals_to_rot_matrix(self.gaussian_model.reference_normals[None, ...], self.normals[None, ...])
+        new_rots = new_rotations.squeeze(0).unsqueeze(1)
+        rotated_vertices = new_rots @ rotated_vertices
         rotated_vertices = rotated_vertices.squeeze(-1)  # [N, 2, 3]
 
         # Finally translate
         translated = rotated_vertices + self.means[:, None, :]
+
         return translated.min(dim=1).values, translated.max(dim=1).values
-    
-    def get_top_16(self):
-        ray_ori = self.ray_oris    # [num_rays, 3]
-        ray_dir = self.ray_dirs     
-        min_corners, max_corners = self.create_bounding_boxes()
-        num_rays = ray_ori.shape[0]
+
+    def get_top_16(self, ray_oris, ray_dirs, min_corners, max_corners):
+        num_rays = ray_oris.shape[0]
         num_boxes = min_corners.shape[0]
 
         # Create an output tensor for indices
-        out_indices = to.full((num_rays, 16), -1, device=ray_ori.device, dtype=to.int32)
+        out_indices = to.full(
+            (num_rays, 32), -1, device=ray_oris.device, dtype=to.int32
+        )
 
         # Get device pointers
-        ray_ori_ptr      = ray_ori.data_ptr()
-        ray_dir_ptr      = ray_dir.data_ptr()
-        min_corners_ptr  = min_corners.data_ptr()
-        max_corners_ptr  = max_corners.data_ptr()
-        out_indices_ptr  = out_indices.data_ptr()
+        ray_ori_ptr = ray_oris.data_ptr()
+        ray_dir_ptr = ray_dirs.data_ptr()
+        min_corners_ptr = min_corners.data_ptr()
+        max_corners_ptr = max_corners.data_ptr()
+        out_indices_ptr = out_indices.data_ptr()
 
         threads_per_block = 256
         blocks = (num_rays + threads_per_block - 1) // threads_per_block
 
         # Launch the kernel
-        kernel((blocks,), (threads_per_block,), 
-            (ray_ori_ptr, ray_dir_ptr, min_corners_ptr, max_corners_ptr,
-                out_indices_ptr, num_rays, num_boxes))
-        
-        return out_indices
+        kernel(
+            (blocks,),
+            (threads_per_block,),
+            (
+                ray_ori_ptr,
+                ray_dir_ptr,
+                min_corners_ptr,
+                max_corners_ptr,
+                out_indices_ptr,
+                num_rays,
+                num_boxes,
+            ),
+        )
+
+        valid_mask = out_indices != -1
+        return out_indices.long(), valid_mask
 
     def get_spatial_hashes(self, x_idxs, y_idxs, z_idxs, spatial_args):
         h = (x_idxs * 8191) ^ (y_idxs * 131071) ^ (z_idxs * 524287)
@@ -481,127 +658,6 @@ class GaussianParameters(nn.Module):
         t_far[no_hit] = to.inf
 
         return t_near, t_far
-
-    def final_project(self):
-        spatial_args = self.get_spatial_args()
-        gx, gy, gz = self.get_spatial_index(self.means, spatial_args)
-        g_hashes = self.get_spatial_hashes(gx, gy, gz, spatial_args)
-        hash_bins = to.bincount(g_hashes)
-        H = spatial_args["num_cells"]
-        B_cell = int(to.max(hash_bins).item())
-        unique_hashes, inverse_indices, counts = to.unique(
-            g_hashes, return_inverse=True, return_counts=True
-        )
-        grouped_indices = {
-            h.item(): to.where(inverse_indices == i)[0]
-            for i, h in enumerate(unique_hashes)
-        }
-        hash_to_g = to.full((H, B_cell), -1, dtype=to.int, device=device)
-        for h, indices in grouped_indices.items():
-            hash_to_g[h, : indices.numel()] = indices
-        cell_mins, cell_maxs = self.compute_cell_bounding_volumes(spatial_args)
-        ray_cell_mask = self.ray_box_intersections_binary(
-            cell_mins, cell_maxs, self.ray_oris, self.ray_dirs
-        )
-        R = self.ray_oris.shape[0]
-        blended_tvals = to.zeros(R, device=device)
-        for r in range(R):
-            cell_indices = to.nonzero(ray_cell_mask[r], as_tuple=True)[0]
-            gaussian_indices = hash_to_g[cell_indices].flatten(-2, -1)
-            valid_gaussians = gaussian_indices[gaussian_indices != -1].unique()
-            valid_gaussians = valid_gaussians[None, ...].long()
-            blended_tvals[r] = self.blend_tvals(r, valid_gaussians)
-
-        plt.plot(blended_tvals.detach().cpu())
-        plt.plot(to.sum(ray_cell_mask, dim=1).detach().cpu())
-        plt.show()
-
-        return blended_tvals
-
-    def get_contributions(self, alphas, tvals):
-        # Sort by t-values (depth) to properly handle occlusion
-        sorted_indices = to.argsort(tvals, dim=1)
-        sorted_alphas = alphas.gather(dim=-1, index=sorted_indices)
-        sorted_tvals = tvals.gather(dim=-1, index=sorted_indices)
-
-        # Calculate transmittance (how much light passes through)
-        alphas_complement = 1 - sorted_alphas
-        transmittance = to.cumprod(alphas_complement, dim=1)
-
-        # First value starts with full visibility
-        shifted = to.ones_like(transmittance)
-        shifted[:, 1:] = transmittance[:, :-1]
-
-        # Weight is visibility * opacity
-        weights = shifted * sorted_alphas
-
-        # Normalize weights to sum to 1
-        weights_sum = weights.sum(dim=1, keepdim=True)
-        eps = 1e-8  # Prevent division by zero
-        normalized_weights = weights / (weights_sum + eps)
-
-        # Map back to original order
-        inv_indices = sorted_indices.argsort(dim=1)
-        return normalized_weights.gather(dim=1, index=inv_indices)
-
-    def blend_tvals(self, ray_idx, ray_gaussian_indices):
-        max_responses, t_vals = get_max_responses_and_tvals(
-            self.ray_oris[ray_idx, None, None, :],
-            self.means[ray_gaussian_indices],
-            self.gaussian_model.covariances[ray_gaussian_indices],
-            self.ray_dirs[ray_idx, None, None, :],
-            self.gaussian_model.opacities[ray_gaussian_indices],
-            self.gaussian_model.reference_normals[ray_gaussian_indices],
-            self.gaussian_model.reference_normals[ray_gaussian_indices],
-        )
-
-        t_vals = t_vals.squeeze(-1)
-        max_responses = max_responses.squeeze(-1)
-        top_responses, top_responses_idxs = max_responses.squeeze(
-            -1).topk(16, dim=-1)
-
-        gathered_tvals = t_vals.gather(-1, top_responses_idxs)
-        # Calculate contribution
-        contributions = self.get_contributions(top_responses, gathered_tvals)
-        blended_tvals = to.sum(contributions * gathered_tvals, dim=-1)
-        return blended_tvals
-
-    def compute_cell_bounding_volumes(self, spatial_args):
-        """
-        Given spatial_args containing grid dimensions, minimum corner, and spacings,
-        compute the axis-aligned bounding boxes (AABBs) for each cell.
-
-        Args:
-            spatial_args (dict): A dictionary with keys:
-                - "n_x", "n_y", "n_z": Grid dimensions.
-                - "min_corner": Tensor of shape [3] for the overall minimum corner.
-                - "spacings": Tensor of shape [3] representing cell sizes along each dimension.
-
-        Returns:
-            box_mins (Tensor): [num_cells, 3] tensor of minimum corners of each cell.
-            box_maxs (Tensor): [num_cells, 3] tensor of maximum corners of each cell.
-        """
-        n_x, n_y, n_z = spatial_args["n_x"], spatial_args["n_y"], spatial_args["n_z"]
-        device = spatial_args["min_corner"].device
-        xs = to.arange(n_x, device=device)
-        ys = to.arange(n_y, device=device)
-        zs = to.arange(n_z, device=device)
-
-        grid_i, grid_j, grid_k = to.meshgrid(xs, ys, zs, indexing="ij")
-        grid_i = grid_i.flatten()
-        grid_j = grid_j.flatten()
-        grid_k = grid_k.flatten()
-
-        # Each cell's minimum corner = global min_corner + (grid indices * cell spacings)
-        cell_mins = (
-            spatial_args["min_corner"].unsqueeze(0)
-            + to.stack([grid_i, grid_j, grid_k], dim=1) *
-            spatial_args["spacings"]
-        )
-        # Each cell's maximum corner = cell minimum + cell spacings
-        cell_maxs = cell_mins + spatial_args["spacings"]
-
-        return cell_mins, cell_maxs
 
     def ray_box_intersections_binary(self, box_mins, box_maxs, ray_oris, ray_dirs):
         """
@@ -705,338 +761,299 @@ class GaussianParameters(nn.Module):
         )
 
         context.canvas.update()
-        return context
+        return context      
+    def project(self, batch_size=2048, temperature=0.01, use_soft_indices=False):
+        num_rays = self.ray_oris.shape[0]
+        num_batches = (num_rays + batch_size - 1) // batch_size
+        all_blended_tvals = []
 
-    def visualize_gaussians_by_hash(self):
-        """
-        Visualize Gaussian means where each one is colored based on its spatial hash.
-        This helps debug/visualize the spatial partitioning scheme.
-        """
-        # Get spatial args for hashing
-        spatial_args = self.get_spatial_args()
+        for i in range(num_batches):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, num_rays)
+            ray_oris_batch = self.ray_oris[start_idx:end_idx]
+            ray_dirs_batch = self.ray_dirs[start_idx:end_idx]
+            # Compute bounding boxes for all Gaussians
+            min_corners, max_corners = self.create_bounding_boxes()
 
-        # Get spatial indices and hashes for each Gaussian mean
-        gx, gy, gz = self.get_spatial_index(self.means, spatial_args)
-        g_hashes = self.get_spatial_hashes(gx, gy, gz, spatial_args)
-
-        # Get unique hashes and assign a normalized value to each
-        unique_hashes = to.unique(g_hashes)
-        num_hashes = len(unique_hashes)
-        hash_to_idx = {h.item(): i for i, h in enumerate(unique_hashes)}
-
-        # Map each hash to a normalized index for coloring
-        hash_indices = to.tensor(
-            [hash_to_idx[h.item()] for h in g_hashes], device=device, dtype=to.float32
-        )
-        hash_indices = hash_indices / \
-            max(1, num_hashes - 1)  # Normalize to [0,1]
-
-        # Create colors using HSV color space for maximum distinction
-        import colorsys
-
-        colors = np.zeros((len(self.means), 4), dtype=np.float32)
-        hash_indices_np = hash_indices.cpu().numpy()
-
-        # Generate visually distinct colors for each hash value
-        for i, idx in enumerate(hash_indices_np):
-            # Convert to RGB from HSV (hue from normalized hash, full saturation/value)
-            r, g, b = colorsys.hsv_to_rgb(idx, 0.8, 0.9)
-            colors[i] = [r, g, b, 1.0]  # RGBA
-
-        # Convert means to numpy for visualization
-        means_np = self.means.detach().cpu().numpy()
-
-        # Create and configure visualization context
-        # Slightly larger points for visibility
-        context = RenderContext(point_size=8)
-        context.scatter.set_data(
-            means_np, face_color=colors, size=context.point_size)
-        context.canvas.update()
-
-        print(
-            f"Visualizing {len(self.means)} Gaussians in {num_hashes} hash buckets")
-        return context
-
-    def project_spatial_vectorized_2(self):
-        """
-        For each ray, uses the grid (from get_spatial_args) to
-        – build a hash table mapping grid cells to gaussian indices,
-        – sample points along each ray (using ray–box intersections),
-        – query candidate Gaussians by hashing the sample positions,
-        – and then compute a blended t-value via response weighting.
-
-        Returns:
-            out_blended_tvals: Tensor of shape [N_rays] with a blended t-value per ray.
-        """
-        # Get spatial grid parameters.
-        spatial_args = self.get_spatial_args()
-        num_cells = spatial_args["num_cells"]
-
-        # -----------------------------
-        # Build hash table for Gaussians.
-        # -----------------------------
-        # self.means is [G,3]. Get cell indices (assume get_spatial_index accepts [G,3]).
-        gx, gy, gz = self.get_spatial_index(self.means, spatial_args)
-        g_hashes = self.get_spatial_hashes(gx, gy, gz, spatial_args)  # [G]
-        # Build a mapping from each cell (0...num_cells-1) to a list of gaussian indices.
-        # We use a simple loop over unique cell values (num_cells is small, e.g. 1000 max).
-        # Use bincount/unique to know how many Gaussians go in each cell.
-        unique_hashes, inv, counts = to.unique(
-            g_hashes, return_inverse=True, return_counts=True
-        )
-        hash_to_g = to.full((num_cells, 32), -1, dtype=to.int64, device=device)
-
-        for h in unique_hashes.tolist():
-            # Find indices in self.means assigned to cell h.
-            idxs = to.where(g_hashes == h)[0]
-            # Cap at 32 Gaussians per cell - take only the first 32
-            if idxs.numel() > 32:
-                idxs = idxs[:32]
-            # Now this will never exceed 32 elements
-            hash_to_g[h, : idxs.numel()] = idxs
-
-        # -----------------------------
-        # Query rays.
-        # -----------------------------
-        # Compute ray-box intersections (t_nears and t_fars for each ray)
-        t_nears, t_fars = self.ray_box_intersections(spatial_args)  # [N]
-        # Use a fixed number of steps along each ray.
-        steps = 10
-        lin_base = to.linspace(0, 1, steps, device=device)  # [steps]
-        sample_t_vals = t_nears.unsqueeze(1) + (t_fars - t_nears).unsqueeze(
-            1
-        ) * lin_base.unsqueeze(0)  # [N,steps]
-        # Compute sample positions along each ray.
-        # self.ray_oris: [N,3], self.ray_dirs: [N,3]
-        sample_positions = self.ray_oris.unsqueeze(1) + self.ray_dirs.unsqueeze(
-            1
-        ) * sample_t_vals.unsqueeze(-1)  # [N,steps,3]
-
-        # Get cell indices for every sample position.
-        rx, ry, rz = self.get_spatial_index(
-            sample_positions, spatial_args
-        )  # each of shape [N,steps]
-        ray_hashes = self.get_spatial_hashes(
-            rx, ry, rz, spatial_args)  # [N,steps]
-
-        # For each sample, retrieve candidate gaussian indices.
-        # hash_to_g has shape [num_cells, 32] so we index it with ray_hashes.
-        # This gives: candidates: [N, steps, 32].
-        candidates = hash_to_g[ray_hashes.long()]  # [N,steps,32]
-        N = self.ray_oris.shape[0]
-        num_candidates = steps * candidates.shape[-1]
-        candidates = candidates.reshape(N, num_candidates)  # [N, steps*32]
-
-        # Build a mask of valid candidates (those != -1)
-        valid_mask = candidates != -1
-        # Clamp candidates for safe indexing:
-        candidates_clamped = candidates.clamp(min=0)
-
-        # -----------------------------
-        # Gather candidate attributes.
-        # -----------------------------
-        # For each candidate index, get Gaussian attributes
-        cand_means = self.means[candidates_clamped]  # [N, num_candidates, 3]
-        cand_covs = self.gaussian_model.covariances[
-            candidates_clamped
-        ]  # [N, num_candidates, 3, 3]
-        cand_opacities = self.gaussian_model.opacities[
-            candidates_clamped
-        ]  # [N, num_candidates]
-        # [N, num_candidates, 3]
-        cand_normals = self.normals[candidates_clamped]
-        cand_ref_normals = self.gaussian_model.reference_normals[
-            candidates_clamped
-        ]  # [N, num_candidates, 3]
-
-        # Expand ray origins/directions to align with candidate dimension.
-        rays_exp = self.ray_oris.unsqueeze(1).expand(
-            -1, num_candidates, -1
-        )  # [N, num_candidates, 3]
-        dirs_exp = self.ray_dirs.unsqueeze(1).expand(
-            -1, num_candidates, -1
-        )  # [N, num_candidates, 3]
-
-        # -----------------------------
-        # Compute responses and t-values.
-        # -----------------------------
-        # get_max_responses_and_tvals expects:
-        #   ray_oris [N, num_candidates, 3],
-        #   candidate means, covariances, etc.
-        responses, t_vals = get_max_responses_and_tvals(
-            rays_exp,
-            cand_means,
-            cand_covs,
-            dirs_exp,
-            cand_opacities,
-            cand_normals,
-            cand_ref_normals,
-        )  # both: [N, num_candidates]
-        responses = responses.squeeze(-1)
-        t_vals = t_vals.squeeze(-1)
-        # Set response=0 for candidates that were not valid.
-        responses = responses * valid_mask.to(responses.dtype)
-        # Then compute contributions using the original responses
-        contributions = self.get_contributions(responses, t_vals)
-        blended_tvals = (contributions * t_vals).sum(dim=1)  # [N]
-
-        # For rays that did not hit the box, output 0.
-        out_blended_tvals = to.zeros(self.ray_oris.shape[0], device=device)
-        valid_rays = to.isfinite(t_nears)
-        out_blended_tvals[valid_rays] = blended_tvals[valid_rays]
-        return out_blended_tvals
-    
- 
-    def project_optimized(
-        self,
-        min_corner,
-        grid_dims,
-        spacings
-    ):
-        means = self.means
-        ray_oris = self.ray_oris
-        ray_dirs = self.ray_dirs
-        covariances = self.gaussian_model.covariances
-        opacities = self.gaussian_model.opacities
-        normals = self.normals
-        reference_normals = self.gaussian_model.reference_normals
-
-        # 1. Setup spatial grid parameters
-        num_cells = grid_dims[0] * grid_dims[1] * grid_dims[2]
-        
-        # 2. Hash all Gaussians into cells
-        g_idxs_x = ((means[:, 0] - min_corner[0]) / spacings[0]).int().clamp(0, grid_dims[0]-1)
-        g_idxs_y = ((means[:, 1] - min_corner[1]) / spacings[1]).int().clamp(0, grid_dims[1]-1)
-        g_idxs_z = ((means[:, 2] - min_corner[2]) / spacings[2]).int().clamp(0, grid_dims[2]-1)
-        
-        # Hash function: Using prime number multiplication for good distribution
-        g_hashes = ((g_idxs_x * 8191) ^ (g_idxs_y * 131071) ^ (g_idxs_z * 524287)) % num_cells
-        
-        # 3. Prepare output arrays
-        R = ray_oris.shape[0]
-        blended_tvals = to.zeros(R, device=ray_oris.device)
-        
-        # 4. Process each ray individually (parallelized by JIT)
-        for r in range(R):
-            # 5. Calculate ray-box intersections
-            inv_dir = 1.0 / to.where(ray_dirs[r] != 0, ray_dirs[r], to.tensor(1e-8, device=ray_dirs.device))
-            t1 = (min_corner - ray_oris[r]) * inv_dir
-            t2 = (min_corner + spacings * grid_dims - ray_oris[r]) * inv_dir
-            
-            t_near = to.max(to.minimum(t1, t2))
-            t_far = to.min(to.maximum(t1, t2))
-            
-            # Skip if no intersection
-            if t_near > t_far or t_far < 0:
-                continue
+            if use_soft_indices:
+                # Get soft t-values and weights for all gaussians
+                soft_tvals, soft_weights = get_soft_top_candidates(
+                    ray_oris_batch, ray_dirs_batch, min_corners, max_corners, temperature=temperature
+                )
                 
-            # 6. Sample points along the ray within the grid
-            num_steps = 10
-            step_size = (t_far - t_near) / num_steps
-            
-            # Container for candidates
-            relevant_gaussians = to.zeros(means.shape[0], dtype=to.bool, device=means.device)
-            
-            # 7. Find all cells intersected by this ray
-            for step in range(num_steps):
-                t = t_near + step * step_size
-                pos = ray_oris[r] + t * ray_dirs[r]
+                # Calculate responses and t-values for all gaussians
+                # (reshape ray origins and directions for broadcasting)
+                responses, tvals = get_max_responses_and_tvals(
+                    ray_oris_batch[:, None, :],
+                    self.means.unsqueeze(0).expand(ray_oris_batch.shape[0], -1, 3),
+                    self.gaussian_model.covariances.unsqueeze(0).expand(ray_oris_batch.shape[0], -1, 3, 3),
+                    ray_dirs_batch[:, None, :],
+                    self.gaussian_model.opacities.unsqueeze(0).expand(ray_oris_batch.shape[0], -1, 1),
+                    self.normals.unsqueeze(0).expand(ray_oris_batch.shape[0], -1, 3),
+                    self.gaussian_model.normals.unsqueeze(0).expand(ray_oris_batch.shape[0], -1, 3),
+                )
                 
-                # Get cell indices
-                cell_x = ((pos[0] - min_corner[0]) / spacings[0]).int().clamp(0, grid_dims[0]-1)
-                cell_y = ((pos[1] - min_corner[1]) / spacings[1]).int().clamp(0, grid_dims[1]-1)
-                cell_z = ((pos[2] - min_corner[2]) / spacings[2]).int().clamp(0, grid_dims[2]-1)
+                # Apply soft weights to responses
+                responses = responses * soft_weights
                 
-                # Get cell hash
-                cell_hash = ((cell_x * 8191) ^ (cell_y * 131071) ^ (cell_z * 524287)) % num_cells
-                
-                # Mark all Gaussians in this cell
-                relevant_gaussians = relevant_gaussians | (g_hashes == cell_hash)
+                # Continue with the same alpha composition as the hard approach
+                _, sorted_idx = to.sort(tvals, dim=1)
+                sorted_alphas = responses.gather(dim=1, index=sorted_idx)
+                alphas_compliment = 1 - sorted_alphas
+                transmittance = to.cumprod(alphas_compliment, dim=1)
+                shifted = to.ones_like(transmittance)
+                shifted[:, 1:] = transmittance[:, :-1]
+                sorted_contribution = shifted - transmittance
+                norm_factor = to.sum(sorted_contribution, dim=1, keepdim=True)
+                sorted_contribution = sorted_contribution / (norm_factor + 1e-8)
+                inv_idx = sorted_idx.argsort(dim=1)
+                contribution = sorted_contribution.gather(dim=1, index=inv_idx)
+                batch_blended_tvals = to.sum(contribution * tvals, dim=1)
+            else:
+                # Existing hard selection method:
+                ray_gaussian_candidates = self.get_top_16_differentiable_batch(ray_oris_batch, ray_dirs_batch).long()
+                responses, tvals = get_max_responses_and_tvals(
+                    ray_oris_batch[:, None, :],
+                    self.means[ray_gaussian_candidates],
+                    self.gaussian_model.covariances[ray_gaussian_candidates],
+                    ray_dirs_batch[:, None, :],
+                    self.gaussian_model.opacities[ray_gaussian_candidates],
+                    self.normals[ray_gaussian_candidates],
+                    self.gaussian_model.normals[ray_gaussian_candidates],
+                )
+                _, sorted_idx = to.sort(tvals, dim=1)
+                sorted_alphas = responses.gather(dim=1, index=sorted_idx)
+                alphas_compliment = 1 - sorted_alphas
+                transmittance = to.cumprod(alphas_compliment, dim=1)
+                shifted = to.ones_like(transmittance)
+                shifted[:, 1:] = transmittance[:, :-1]
+                sorted_contribution = shifted - transmittance
+                norm_factor = to.sum(sorted_contribution, dim=1, keepdim=True)
+                sorted_contribution = sorted_contribution / (norm_factor + 1e-8)
+                inv_idx = sorted_idx.argsort(dim=1)
+                contribution = sorted_contribution.gather(dim=1, index=inv_idx)
+                batch_blended_tvals = to.sum(contribution * tvals, dim=1)
+
+            all_blended_tvals.append(batch_blended_tvals)
+
+        return to.cat(all_blended_tvals, dim=0)[..., None]
+
+    def project_2(self,batch_size=2048):
+
+        num_rays = self.ray_oris.shape[0]
+        num_batches = (num_rays + batch_size - 1) // batch_size
+        all_blended_tvals = []
+
+        # self.ray_oris, self.ray_dirs = generate_rays_from_points(self.gaussian_model.means, 2, 0.1)
+        for i in range(num_batches):
+            # Get batch indices
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, num_rays)
             
-            # 8. Extract relevant Gaussians
-            indices = to.where(relevant_gaussians)[0]
-            
-            if indices.shape[0] == 0:
-                continue
-                
-            # 9. Compute responses only for relevant Gaussians
-            ray_ori_exp = ray_oris[r:r+1, None]
-            ray_dir_exp = ray_dirs[r:r+1, None]
-            relevant_means = means[indices][None]
-            relevant_covs = covariances[indices][None]
-            relevant_opacities = opacities[indices][None]
-            relevant_normals = normals[indices][None]
-            relevant_ref_normals = reference_normals[indices][None]
-            
-            # Get responses and t-values
+            # Get ray data for this batch
+            ray_oris_batch = self.ray_oris[start_idx:end_idx]
+            ray_dirs_batch = self.ray_dirs[start_idx:end_idx]
+
+
+            ray_gaussian_indices = self.get_top_16_differentiable_batch(ray_oris_batch, ray_dirs_batch)
+
+            # Calculate responses and t-values
             responses, tvals = get_max_responses_and_tvals(
-                ray_ori_exp,
-                relevant_means,
-                relevant_covs,
-                ray_dir_exp, 
-                relevant_opacities,
-                relevant_normals,
-                relevant_ref_normals
+                ray_oris_batch[:, None, :],
+                self.means[ray_gaussian_indices],
+                self.gaussian_model.covariances[ray_gaussian_indices],
+                ray_dirs_batch[:, None, :],
+                self.gaussian_model.opacities[ray_gaussian_indices],
+                self.normals[ray_gaussian_indices],
+                self.gaussian_model.normals[ray_gaussian_indices],
             )
             
-            responses = responses.squeeze()
-            tvals = tvals.squeeze()
+            # Sort by t-values
+            _, sorted_idx = to.sort(tvals, dim=1)
+            sorted_alphas = responses.gather(dim=1, index=sorted_idx)
             
-            # Add batch dimension if needed - this fixes the dimension error
-            if len(tvals.shape) == 1:
-                responses = responses.unsqueeze(0)
-                tvals = tvals.unsqueeze(0)
-                    
-            # Sort by depth for proper compositing
-            sorted_idx = to.argsort(tvals, dim=1)
-            sorted_alphas = responses.gather(1, sorted_idx)
-            sorted_tvals = tvals.gather(1, sorted_idx)
+            # Calculate transmittance
+            alphas_compliment = 1 - sorted_alphas
+            transmittance = to.cumprod(alphas_compliment, dim=1)
             
-            alphas_complement = 1 - sorted_alphas
-            transmittance = to.cumprod(alphas_complement, dim=1)
+            # Calculate contributions
             shifted = to.ones_like(transmittance)
             shifted[:, 1:] = transmittance[:, :-1]
+            sorted_contribution = shifted - transmittance
             
-            weights = shifted * sorted_alphas
-            weights_sum = weights.sum(dim=1, keepdim=True)
-            normalized_weights = weights / (weights_sum + 1e-8)
+            # Normalize contributions
+            norm_factor = to.sum(sorted_contribution, dim=1, keepdim=True)
+            # Add small epsilon to avoid division by zero
+            sorted_contribution = sorted_contribution / (norm_factor + 1e-8)
             
-            # Compute final blended t-value
-            blended_tvals[r] = (normalized_weights * sorted_tvals).sum()
+            # Unsort the contribution
+            inv_idx = sorted_idx.argsort(dim=1)
+            contribution = sorted_contribution.gather(dim=1, index=inv_idx)
+            
+            # Calculate blended t-values
+            batch_blended_tvals = to.sum(contribution * tvals, dim=1)
+            all_blended_tvals.append(batch_blended_tvals)
         
-        return blended_tvals
-
-    def project(self,):
-        ray_gaussian_candidates = self.get_top_16().long()
-
-        responses, tvals = get_max_responses_and_tvals(
-            self.ray_oris[:, None, :],
-            self.means[ray_gaussian_candidates],
-            self.gaussian_model.covariances[ray_gaussian_candidates],
-            self.ray_dirs[:, None, :],
-            self.gaussian_model.opacities[ray_gaussian_candidates],
-            self.normals[ray_gaussian_candidates],
-            self.gaussian_model.normals[ray_gaussian_candidates],
+        
+        # Concatenate results from all batches
+        return to.cat(all_blended_tvals , dim=0)
+    def get_top_16_differentiable_batch(self, ray_oris, ray_dirs):
+        """
+        Batched version of get_top_16_differentiable.
+        
+        Args:
+            ray_oris: Ray origins tensor of shape [batch_size, 3]
+            ray_dirs: Ray directions tensor of shape [batch_size, 3]
+            
+        Returns:
+            torch.Tensor: Indices of top 16 closest boxes for each ray
+        """
+        # Get bounding box corners
+        min_corners, max_corners = self.create_bounding_boxes()
+        
+        # Get dimensions
+        num_rays = ray_oris.shape[0]
+        num_boxes = min_corners.shape[0]
+        
+        # Expand dimensions for broadcasting
+        ray_oris_exp = ray_oris.unsqueeze(1)  # [R, 1, 3]
+        ray_dirs_exp = ray_dirs.unsqueeze(1)  # [R, 1, 3]
+        min_corners_exp = min_corners.unsqueeze(0)  # [1, B, 3]
+        max_corners_exp = max_corners.unsqueeze(0)  # [1, B, 3]
+        
+        # Compute safe reciprocal of ray directions
+        safe_ray_dirs = to.where(
+            ray_dirs_exp != 0, ray_dirs_exp, to.full_like(ray_dirs_exp, 1e-8)
         )
-        _, sorted_idx = to.sort(tvals, dim=1)
-        sorted_alphas = responses.gather(dim=1, index=sorted_idx)
-        alphas_compliment = 1 - sorted_alphas
-        transmittance = to.cumprod(alphas_compliment, dim=1)
-        shifted = to.ones_like(transmittance)
-        # Fill shifted starting from the second column with the values of x's columns 0 to N-2
-        shifted[:, 1:] = transmittance[:, :-1]
-        # Calculate contribution
-        sorted_contribution = shifted - transmittance
-        # unsort the contribution
-        inv_idx = sorted_idx.argsort(dim=1)
-        # Reorder contribution back to the original order:
-        contribution = sorted_contribution.gather(dim=1, index=inv_idx)
-        blended_tvals = to.sum(contribution * tvals, dim=1)
-        return blended_tvals
-    
+        inv_dirs = 1.0 / safe_ray_dirs  # [R, 1, 3]
+        
+        # Compute intersection t-values
+        t1 = (min_corners_exp - ray_oris_exp) * inv_dirs
+        t2 = (max_corners_exp - ray_oris_exp) * inv_dirs
+        
+        t_min = to.minimum(t1, t2)
+        t_max = to.maximum(t1, t2)
+        
+        t_entry = to.max(t_min, dim=2)[0]
+        t_exit = to.min(t_max, dim=2)[0]
+        
+        hit = (t_exit > t_entry) & (t_exit > 0)
+        t_hit = to.where(t_entry > 0, t_entry, t_exit)
+        t_hit = to.where(hit, t_hit, to.full_like(t_hit, float("inf")))
+        
+        # Get top 16 closest hit boxes
+        k = min(16, num_boxes)
+        top_values, top_indices = to.topk(t_hit, k=k, dim=1, largest=False)
+        
+        # Pad with -1 if needed
+        if k < 16:
+            padding = to.full(
+                (num_rays, 16 - k), 
+                -1,
+                device=top_indices.device, 
+                dtype=top_indices.dtype
+            )
+            top_indices = to.cat([top_indices, padding], dim=1)
+        
+        return top_indices
+    def get_top_16_differentiable(self):
+        """
+        Differentiable PyTorch implementation of ray-box intersection that returns
+        indices of the 16 closest bounding boxes for each ray.
+
+        Returns:
+            torch.Tensor: Indices of shape [num_rays, 16] with the closest box indices
+        """
+        # Get ray origins, directions, and bounding box corners
+        ray_oris = self.ray_oris  # [R, 3]
+        ray_dirs = self.ray_dirs  # [R, 3]
+        # [B, 3], [B, 3]
+        min_corners, max_corners = self.create_bounding_boxes()
+
+        # Get dimensions
+        num_rays = ray_oris.shape[0]
+        num_boxes = min_corners.shape[0]
+
+        # Expand dimensions for broadcasting
+        ray_oris_exp = ray_oris.unsqueeze(1)  # [R, 1, 3]
+        ray_dirs_exp = ray_dirs.unsqueeze(1)  # [R, 1, 3]
+        min_corners_exp = min_corners.unsqueeze(0)  # [1, B, 3]
+        max_corners_exp = max_corners.unsqueeze(0)  # [1, B, 3]
+
+        # Compute safe reciprocal of ray directions (handle zeros)
+        safe_ray_dirs = to.where(
+            ray_dirs_exp != 0, ray_dirs_exp, to.full_like(ray_dirs_exp, 1e-8)
+        )
+        inv_dirs = 1.0 / safe_ray_dirs  # [R, 1, 3]
+
+        # Compute t values for each corner
+        t1 = (min_corners_exp - ray_oris_exp) * inv_dirs  # [R, B, 3]
+        t2 = (max_corners_exp - ray_oris_exp) * inv_dirs  # [R, B, 3]
+
+        # Get entry and exit t values for each axis
+        t_min = to.minimum(t1, t2)  # [R, B, 3]
+        t_max = to.maximum(t1, t2)  # [R, B, 3]
+
+        # Calculate overall entry and exit times
+        t_entry = to.max(t_min, dim=2)[0]  # [R, B]
+        t_exit = to.min(t_max, dim=2)[0]  # [R, B]
+
+        # A hit occurs when t_exit > max(0, t_entry)
+        hit = (t_exit > t_entry) & (t_exit > 0)  # [R, B]
+
+        # Use t_entry if positive, otherwise t_exit
+        t_hit = to.where(t_entry > 0, t_entry, t_exit)  # [R, B]
+
+        # Mark non-hit boxes with infinite distance
+        t_hit = to.where(hit, t_hit, to.full_like(t_hit, float("inf")))
+
+        # Get top 16 closest hit boxes (or fewer if there aren't 16 hits)
+        k = min(16, num_boxes)
+        top_values, top_indices = to.topk(t_hit, k=k, dim=1, largest=False)
+
+        # If fewer than 16 boxes, pad with -1
+        if k < 16:
+            padding = to.full(
+                (num_rays, 16 - k),
+                -1,
+                device=top_indices.device,
+                dtype=top_indices.dtype,
+            )
+            top_indices = to.cat([top_indices, padding], dim=1)
+
+        return top_indices
+        
+    def implicit_depth_update(self, d_current, delta_t):
+        # Solve the linear system (I + delta_t * laplacian) * d_new = d_current
+        I = to.eye(self.laplacian.shape[0], device=self.laplacian.device)
+        A = I + delta_t * self.laplacian
+        d_new = to.linalg.solve(A, d_current)
+        return d_new
+
+    def based_loss(self):
+        ray_oris, ray_dirs = generate_rays_from_points(self.gaussian_model.means, 2)
+        self.ray_oris = ray_oris.to(device)
+        self.ray_dirs = ray_dirs.to(device)
+        self.num_rays = ray_oris.shape[0]
+        return compute_graph_laplacian_loss(ray_oris, self.project_2())
+        
+
     def harmonic_loss(self):
+        ray_oris, ray_dirs = generate_rays_from_points(self.gaussian_model.means, 2)
+        model.ray_oris = ray_oris.to(device)
+        model.ray_dirs = ray_dirs.to(device)
+        model.num_rays = ray_oris.shape[0]
+        model.laplacian = compute_graph_laplacian_loss(ray_oris, model.project_2()).to(device)
+        # Compute the main loss via the Laplacian quadratic form on the projected t-values.
+        delta_t = 1.0                    
+        d_current = self.project_2()    
+        d_new = self.implicit_depth_update(d_current, delta_t)
+        feature_loss = to.sum((d_new - d_current) ** 2)
+        return feature_loss
+    def harmonic_loss_2(self):
         # Compute the current projection of t-values.
         blended_t_vals = self.project()
+    
         if to.isnan(blended_t_vals).any() or to.isinf(blended_t_vals).any():
             raise ValueError("NaN or Inf detected in blended_t_vals")
 
@@ -1046,8 +1063,8 @@ class GaussianParameters(nn.Module):
         feature_loss = feature_factor * (
             blended_t_vals.T @ self.laplacian @ blended_t_vals
         )
-        
-        '''
+
+        """
         # Set up and solve the implicit update: (I + dt*dampening_factor*L) * f_new = f_prev.
         I = to.eye(self.laplacian.shape[0], device=self.laplacian.device)
         A = I + dt * dampening_factor * self.laplacian
@@ -1058,7 +1075,7 @@ class GaussianParameters(nn.Module):
 
         # Update f_prev for the next iteration without detaching f_new.
         self.f_prev = f_new.detach()
-        '''
+        """
         # Return the total loss combining implicit and feature losses.
         return feature_loss
 
@@ -1132,7 +1149,7 @@ def matrix_to_quaternion(rotation_matrices):
     cond1 = trace > 0
     cond2 = (rotation_matrices[:, 0, 0] > rotation_matrices[:, 1, 1]) & ~cond1
     cond3 = (rotation_matrices[:, 1, 1] >
-             rotation_matrices[:, 2, 2]) & ~(cond1 | cond2)
+            rotation_matrices[:, 2, 2]) & ~(cond1 | cond2)
     cond4 = ~(cond1 | cond2 | cond3)
 
     S = to.zeros_like(trace)
@@ -1312,7 +1329,7 @@ def save_optimized_gaussian_model(model, output_path="optimized_point_cloud.ply"
     ply_element = PlyElement.describe(new_data, "vertex")
     PlyData([ply_element], text=False).write(output_path)
 
-import threading
+
 def visualize_depth_updates(model, update_interval=0.1):
     """
     Visualize the current depth values by plotting the points
@@ -1322,54 +1339,493 @@ def visualize_depth_updates(model, update_interval=0.1):
     """
     from vispy import scene, app
     import numpy as np
-    import torch as to
 
     # Set up the canvas and view.
     canvas = scene.SceneCanvas(keys="interactive", bgcolor="black")
     view = canvas.central_widget.add_view()
-    
-    # Create a markers visual for the projected points.
-    scatter = scene.visuals.Markers(parent=view.scene)
-    # Initialize with the ray origins to avoid None data.
-    initial_points = model.ray_oris.detach().cpu().numpy() + model.f_prev.detach().cpu().numpy() * model.ray_dirs.detach().cpu().numpy()
-    scatter.set_data(initial_points, face_color='red', size=8)
+    view.camera = scene.cameras.TurntableCamera()
 
-    # Update function called every timer tick.
+    # Create markers visuals once, outside the update function
+    scatter = scene.visuals.Markers(parent=view.scene)
+    scatter_means = scene.visuals.Markers(parent=view.scene)
+
+    # Initialize with the ray origins
+    initial_points = (
+        model.ray_oris.detach().cpu().numpy()
+        + model.project_2().detach().cpu().numpy() * model.ray_dirs.detach().cpu().numpy()
+    )
+
+    scatter.set_data(initial_points, face_color="red", size=10)
+    
+    # Initialize means visualization
+    means = model.means.detach().cpu().numpy()
+    scatter_means.set_data(means, face_color="blue", size=10)
+
+    # Update function called every timer tick
     def update(event):
-        # Compute new positions as: ray_ori + (depth * ray_dir)     
-        new_points = model.ray_oris.detach().cpu().numpy() + model.f_prev.detach().cpu().numpy() * model.ray_dirs.detach().cpu().numpy()
-        # Update scatter data.
-        scatter.set_data(new_points, face_color='red', size=8)
+        # Compute new positions as: ray_ori + (depth * ray_dir)
+        new_points = (
+            model.ray_oris.detach().cpu().numpy()
+            + model.project_2().detach().cpu().numpy()
+            * model.ray_dirs.detach().cpu().numpy()
+        )
+        
+        # Update existing scatter visuals instead of creating new ones
+        scatter.set_data(new_points, face_color="red", size=10)
+        
+        # Update means visualization
+        means = model.means.detach().cpu().numpy()
+        scatter_means.set_data(means, face_color="blue", size=10)
+        
         canvas.update()
 
     # Set up a timer to update the visualization periodically.
     timer = app.Timer(interval=update_interval, connect=update, start=True)
-
-    view.camera = scene.cameras.TurntableCamera()
-    view.camera.set_range()
     
+    view.camera.set_range()
     canvas.show()
     app.run()
-def start_visualization(model, update_interval=0.1):
+
+
+def start_visualization(model, update_interval=0.2      ):
     visualize_depth_updates(model, update_interval=update_interval)
 
-def train_model(model, num_iterations=1000, lr=0.001):
-    optimizer = to.optim.Adam(model.parameters(), lr=lr)
-    model.f_prev = model.project().detach()
-    print
-    vis_thread = threading.Thread(target=start_visualization, args=(model,))
-    vis_thread.start()
+
+def train_model(model, num_iterations=200, lr=0.001):
+    
+    optimizer = to.optim.Adamax(model.parameters(), lr=lr)
     for iteration in tqdm(range(num_iterations)):
-        optimizer.zero_grad()
-        loss = model.harmonic_loss()
-        loss.backward()
+        optimizer.zero_grad()        
+
+        loss = model.based_2()
+    
+        loss.backward(retain_graph=True)
+
         optimizer.step()
+    
+
     save_optimized_gaussian_model(
-        model, output_path="optimized_point_cloud.ply")
+        model, output_path="optimized_point_cloud.ply") 
+
+def get_box_corners(mins, maxs):
+    """
+    Compute the 8 corners of a 3D bounding box (vectorized version).
+
+    Args:
+        mins: (B, 3) tensor/array for minimum corner of the box.
+        maxs: (B, 3) tensor/array for maximum corner of the box.
+
+    Returns:
+        (B, 8, 3) tensor/array with the 8 corners of the box.
+    """
+    B = mins.shape[0]
+    device = mins.device
+    
+    # Create binary pattern for all 8 corners (use min or max for each dimension)
+    # Format: [x, y, z] where 0=min, 1=max
+    corner_pattern = to.tensor([
+        [0, 0, 0],  # min, min, min
+        [1, 0, 0],  # max, min, min
+        [1, 1, 0],  # max, max, min
+        [0, 1, 0],  # min, max, min
+        [0, 0, 1],  # min, min, max
+        [1, 0, 1],  # max, min, max
+        [1, 1, 1],  # max, max, max
+        [0, 1, 1],  # min, max, max
+    ], device=device).float()
+    
+    # Expand dimensions for broadcasting: (1, 8, 3)
+    pattern = corner_pattern.unsqueeze(0)
+    
+    # Expand mins and maxs for broadcasting: (B, 1, 3)
+    mins_exp = mins.unsqueeze(1)
+    maxs_exp = maxs.unsqueeze(1)
+    
+    # Use pattern to select between min and max for each corner
+    # (B, 8, 3) = (B, 1, 3) * (1, 8, 3) + (B, 1, 3) * (1 - (1, 8, 3))
+    corners = maxs_exp * pattern + mins_exp * (1 - pattern)
+    
+    return corners
+def test_scenario(old_mins, old_maxs, old_normals, new_normals):
+    # Get all 8 corners of the bounding boxes.
+    old_corners = get_box_corners(old_mins, old_maxs)
+    rotation_matrix = normals_to_rot_matrix(old_normals, new_normals)
+    # Translate the corners to the origin.
+    old_centres = (old_mins + old_maxs) / 2
+    new_corners = old_corners - old_centres[:, None, :]
+    # Rotate the corners.
+    new_corners = to.einsum("bij,bkj->bki", rotation_matrix, new_corners)
+    # Translate the corners back to the original position.
+    new_corners += old_centres[:, None, :]
+
+    # Select a single box for visualization.
+    box_idx = to.argmax(old_maxs - old_mins)
+    render_bounding_boxes(old_corners[box_idx:box_idx + 1],
+                        new_corners[box_idx:box_idx + 1],
+                        old_normals[box_idx:box_idx + 1],
+                        new_normals[box_idx:box_idx + 1])
+    raise Exception
+
+
+def render_bounding_boxes(old_corners, new_corners, old_normals, new_normals):
+    """
+    Render bounding boxes and their normal vectors in 3D.
+    
+    Args:
+        old_corners: (B, 8, 3) tensor with corners of old bounding boxes
+        new_corners: (B, 8, 3) tensor with corners of new bounding boxes
+        old_normals: (B, 3) tensor with old normal directions
+        new_normals: (B, 3) tensor with new normal directions
+    """
+    from vispy import scene, app
+    import numpy as np
+    
+    # Convert to NumPy arrays if tensors
+    if isinstance(old_corners, to.Tensor):
+        old_corners = old_corners.detach().cpu().numpy()
+    if isinstance(new_corners, to.Tensor):
+        new_corners = new_corners.detach().cpu().numpy()
+    if isinstance(old_normals, to.Tensor):
+        old_normals = old_normals.detach().cpu().numpy()
+    if isinstance(new_normals, to.Tensor):
+        new_normals = new_normals.detach().cpu().numpy()
+    
+    # Create scene
+    canvas = scene.SceneCanvas(keys='interactive', show=True, bgcolor='black')
+    view = canvas.central_widget.add_view()
+    view.camera = scene.cameras.TurntableCamera(center=(0, 0, 0), fov=40)
+    
+    # Calculate box centers
+    old_centers = old_corners.mean(axis=1)  # (B, 3)
+    new_centers = new_corners.mean(axis=1)  # (B, 3)
+    
+    # Define box wireframe connections (edges between vertices)
+    box_connections = np.array([
+        [0, 1], [1, 5], [5, 4], [4, 0],  # bottom face
+        [0, 3], [3, 2], [2, 1], [2, 6], [6, 5],  # sides
+        [7, 6], [7, 3], [7, 4]  # remaining edges
+    ])
+    
+    # Loop through boxes (usually just one box in this case)
+    for i in range(old_corners.shape[0]):
+        # Create old box wireframe (blue)
+        old_box = scene.visuals.Line(
+            pos=old_corners[i],
+            connect=box_connections,
+            color=(0, 0, 1, 1),  # blue
+            width=2,
+            parent=view.scene
+        )
+        
+        # Create new box wireframe (pink)
+        new_box = scene.visuals.Line(
+            pos=new_corners[i],
+            connect=box_connections,
+            color=(1, 0.5, 0.8, 1),  # pink
+            width=2,
+            parent=view.scene
+        )
+        
+        # Scale factor for normal vectors (make them visible enough)
+        scale = 1.0
+        
+        # Create old normal vector (red)
+        old_normal_end = old_centers[i] + old_normals[i] * scale
+        old_normal_line = scene.visuals.Line(
+            pos=np.array([old_centers[i], old_normal_end]),
+            color=(1, 0, 0, 1),  # red
+            width=3,
+            parent=view.scene
+        )
+        
+        # Create new normal vector (green)
+        new_normal_end = new_centers[i] + new_normals[i] * scale
+        new_normal_line = scene.visuals.Line(
+            pos=np.array([new_centers[i], new_normal_end]),
+            color=(0, 1, 0, 1),  # green
+            width=3,
+            parent=view.scene
+        )
+    
+    view.camera.set_range()
+    view.camera.center = old_corners.mean(axis=1).mean(axis=0)
+    app.run()
+
+def get_soft_top_candidates(ray_oris, ray_dirs, min_corners, max_corners, temperature=0.1):  # Increased temperature
+    # Expand dimensions for broadcasting as in your hard selection method.
+    ray_oris_exp = ray_oris.unsqueeze(1)   # [R, 1, 3]
+    ray_dirs_exp = ray_dirs.unsqueeze(1)     # [R, 1, 3]
+    min_corners_exp = min_corners.unsqueeze(0)  # [1, B, 3]
+    max_corners_exp = max_corners.unsqueeze(0)  # [1, B, 3]
+
+    # Check if any boxes are invalid (min > max)
+    invalid_boxes = (min_corners > max_corners).any(dim=1)
+    if invalid_boxes.any():
+        print(f"Warning: {invalid_boxes.sum().item()} invalid bounding boxes detected!")
+    
+    safe_ray_dirs = to.where(ray_dirs_exp != 0, ray_dirs_exp, to.full_like(ray_dirs_exp, 1e-8))
+    inv_dirs = 1.0 / safe_ray_dirs
+
+    t1 = (min_corners_exp - ray_oris_exp) * inv_dirs
+    t2 = (max_corners_exp - ray_oris_exp) * inv_dirs
+
+    t_min = to.minimum(t1, t2)
+    t_max = to.maximum(t1, t2)
+
+    t_entry = t_min.amax(dim=2)
+    t_exit = t_max.amin(dim=2)
+
+    # Determine hit condition and select t_hit
+    hit = (t_exit > t_entry) & (t_exit > 0)
+    t_hit = to.where(t_entry > 0, t_entry, t_exit) 
+    
+    # Count the hits to see if there's a problem
+    total_hits = hit.sum().item()
+    if total_hits == 0:
+        print("Warning: No ray-box intersections found!")
+        # Return default values instead of NaNs
+        return to.ones(ray_oris.shape[0], device=ray_oris.device), to.zeros((ray_oris.shape[0], min_corners.shape[0]), device=ray_oris.device)
+    
+    # Replace inf values with a large but finite number
+    max_valid = t_hit[hit].max().item() if hit.any() else 1000.0
+    t_hit = to.where(hit, t_hit, to.full_like(t_hit, max_valid * 10))
+    
+    # Scale t_hit to avoid extremely large values in softmax
+    t_scaled = t_hit / max(1.0, t_hit.abs().max().item())
+    
+    # Apply a softmax with more stable temperature
+    weights = to.softmax(-t_scaled / temperature, dim=1)
+    
+    # Compute a weighted t-value for each ray, avoiding inf*0 which causes NaNs
+    soft_tvals = to.sum(weights * to.where(to.isinf(t_hit), to.zeros_like(t_hit), t_hit), dim=1)
+    
+    return soft_tvals, weights
+def rotation_matrix_from_vectors(a, b, eps=1e-8):
+    """
+    Compute the rotation matrix that maps vector a to vector b using Rodrigues' formula.
+    a and b should be 1D tensors of shape (3,) and normalized.
+    """
+    a = a / to.norm(a)
+    b = b / to.norm(b)
+    v = to.cross(a, b)
+    c = to.dot(a, b)
+    s = to.norm(v)
+    if s < eps:
+        # if vectors are parallel or anti-parallel
+        if c > 0:
+            return to.eye(3, device=a.device)
+        else:
+            # If a and b are opposite, choose an arbitrary orthogonal axis.
+            # Here, we choose an axis orthogonal to a.
+            orthogonal = to.tensor([1.0, 0.0, 0.0], device=a.device)
+            if abs(a[0]) > 0.9:
+                orthogonal = to.tensor([0.0, 1.0, 0.0], device=a.device)
+            v = to.cross(a, orthogonal)
+            v = v / to.norm(v)
+            vx = skew_symmetric(v)
+            return to.eye(3, device=a.device) + 2 * vx @ vx
+    vx = skew_symmetric(v)
+    R = to.eye(3, device=a.device) + vx + (vx @ vx) * ((1 - c) / (s**2))
+    return R
+
+def batched_rotation_matrices(A, B, eps=1e-8):
+    # A, B have shape (R, N, 3)
+    R_mats = []
+    R, N = A.shape[0], A.shape[1]
+    for r in range(R):
+        mats = []
+        for n in range(N):
+            mat = rotation_matrix_from_vectors(A[r, n], B[r, n], eps)
+            mats.append(mat[None, ...])  # shape: (1, 3, 3)
+        R_mats.append(to.cat(mats, dim=0)[None, ...])
+    return to.cat(R_mats, dim=0)  # shape: (R, N, 3, 3)
+def create_complete_rotation(v_original, v_target):
+    # Normalize inputs
+    v_original = v_original / to.norm(v_original)
+    v_target = v_target / to.norm(v_target)
+    
+    # First, find the rotation axis and angle
+    rotation_axis = to.cross(v_original, v_target)
+    rotation_axis_norm = to.norm(rotation_axis)
+    
+    # If vectors are nearly parallel, choose a perpendicular axis
+    if rotation_axis_norm < 1e-6:
+        # Check if they're nearly the same or opposite
+        if to.dot(v_original, v_target) > 0:
+            # Nearly the same, no rotation needed
+            return to.eye(3, device=v_original.device)
+        else:
+            # Nearly opposite, rotate 180° around perpendicular axis
+            # Find a consistent perpendicular axis
+            if abs(v_original[0]) < abs(v_original[1]):
+                rotation_axis = to.tensor([1.0, 0.0, 0.0], device=v_original.device)
+            else:
+                rotation_axis = to.tensor([0.0, 1.0, 0.0], device=v_original.device)
+            rotation_axis = rotation_axis - to.dot(rotation_axis, v_original) * v_original
+            rotation_axis = rotation_axis / to.norm(rotation_axis)
+            
+    else:
+        rotation_axis = rotation_axis / rotation_axis_norm
+    
+    # Compute rotation angle
+    cos_angle = to.clamp(to.dot(v_original, v_target), -1.0, 1.0)
+    angle = to.acos(cos_angle)
+    
+    # Build rotation matrix using Rodrigues' formula
+    K = skew_symmetric(rotation_axis)
+    R = to.eye(3, device=v_original.device) + \
+        to.sin(angle) * K + \
+        (1 - cos_angle) * (K @ K)
+    
+    return R
+
+
+from scipy.spatial.transform import Rotation
+def align_normal_with_scipy(old_normal, new_normal):
+    """
+    Compute the rotation matrix that aligns old_normal to new_normal using SciPy.
+
+    Args:
+        old_normal: torch.Tensor of shape (3,) representing the reference normal.
+        new_normal: torch.Tensor of shape (3,) representing the target normal.
+
+    Returns:
+        R: torch.Tensor of shape (3,3) rotation matrix.
+        rmsd: Root mean squared deviation from the alignment (float).
+    """
+    # Ensure the vectors are normalized
+    old_normal = old_normal / (old_normal.norm() + 1e-8)
+    new_normal = new_normal / (new_normal.norm() + 1e-8)
+    
+    # Convert to numpy and reshape to (1,3) as align_vectors expects an array of vectors.
+    old_np = old_normal.detach().cpu().numpy().reshape(1, 3)
+    new_np = new_normal.detach().cpu().numpy().reshape(1, 3)
+    
+    # align_vectors returns the rotation that aligns the source (old) to the target (new)
+    rot, rmsd = Rotation.align_vectors(new_np, old_np)
+    return rot, rmsd
+def plot_points(positions, colors=None, point_size=10):
+    """
+    Plot a set of 3D points using Vispy.
+
+    Args:
+        positions: torch.Tensor or numpy array of shape (N, 3) containing point positions
+        colors: Optional color array. If None, points are white. Can be:
+            - Single RGB/RGBA tuple (applies to all points)
+            - (N, 3) or (N, 4) array of RGB/RGBA values
+        point_size: Size of points to render
+
+    Returns:
+        context: The RenderContext object for further customization
+    """
+    from vispy import scene, app
+    import numpy as np
+    
+    # Convert to numpy if tensor
+    if isinstance(positions, to.Tensor):
+        positions = positions.detach().cpu().numpy()
+    
+    # Default color (white) if none provided
+    if colors is None:
+        colors = (1.0, 1.0, 1.0, 1.0)  # White with full opacity
+    
+    # Create visualization context
+    canvas = scene.SceneCanvas(keys="interactive", show=True, bgcolor="black")
+    view = canvas.central_widget.add_view()
+    view.camera = scene.cameras.TurntableCamera(fov=45)
+    
+    # Create scatter plot
+    scatter = scene.visuals.Markers(parent=view.scene)
+    scatter.set_data(positions, edge_color=None, face_color=colors, size=point_size)
+    
+    # Add axes for reference
+    axis = scene.visuals.XYZAxis(parent=view.scene)
+    
+    # Set view range
+    view.camera.set_range()
+    
+    # Return the canvas so it stays alive
+    app.run()
+    
+    return canvas
+
+def rotate_bounding_box(box_min: to.Tensor, box_max: to.Tensor, rotation: Rotation):
+    """
+    Apply a SciPy rotation to a bounding box defined by box_min and box_max.
+    
+    Args:
+        box_min (torch.Tensor): Tensor of shape (3,) for the minimum corner.
+        box_max (torch.Tensor): Tensor of shape (3,) for the maximum corner.
+        rotation (Rotation): A SciPy Rotation object representing the rotation.
+        
+    Returns:
+        new_box_min (torch.Tensor): Tensor of shape (3,) for the new minimum corner.
+        new_box_max (torch.Tensor): Tensor of shape (3,) for the new maximum corner.
+    """
+    # Compute the center of the bounding box.
+    center = (box_min + box_max) / 2
+
+    # Compute all 8 vertices of the bounding box.
+    vertices = to.tensor([
+        [box_min[0], box_min[1], box_min[2]],
+        [box_min[0], box_min[1], box_max[2]],
+        [box_min[0], box_max[1], box_min[2]],
+        [box_min[0], box_max[1], box_max[2]],
+        [box_max[0], box_min[1], box_min[2]],
+        [box_max[0], box_min[1], box_max[2]],
+        [box_max[0], box_max[1], box_min[2]],
+        [box_max[0], box_max[1], box_max[2]],
+    ], device=box_min.device, dtype=box_min.dtype)
+
+    # Translate vertices so that rotation happens around the center.
+    vertices_centered = vertices - center
+
+    # Convert vertices to NumPy for applying the SciPy rotation.
+    vertices_np = vertices_centered.detach().cpu().numpy()
+    rotated_vertices_np = rotation.apply(vertices_np)
+    
+    # Convert the rotated vertices back to a Torch tensor.
+    rotated_vertices = to.from_numpy(rotated_vertices_np).to(box_min.device, dtype=box_min.dtype)
+
+    # Translate the vertices back to the original coordinate space.
+    rotated_vertices = rotated_vertices + center
+
+    # Compute the new bounding box corners from the rotated vertices.
+    new_box_min = rotated_vertices.min(dim=0)[0]
+    new_box_max = rotated_vertices.max(dim=0)[0]
+    return new_box_min, new_box_max
+
 
 
 if __name__ == "__main__":
-    model = GaussianParameters("point_cloud.ply")
-    train_model(model=model, num_iterations=100)
+    import matplotlib.cm as cm
+    model = GaussianParameters("chair.ply")
+
+    '''
+    blended_t_tvals = model.project()
+    positions = model.ray_oris + model.ray_dirs * blended_t_tvals
+    residual = model.laplacian @ blended_t_tvals  # shape: [num_rays]
+    residual = residual.squeeze(-1)
+    residual_np = residual.detach().cpu().numpy()
+    norm_res = (residual_np - residual_np.min()) / (residual_np.max() - residual_np.min() + 1e-8)
+    colors = cm.viridis(norm_res)  # returns RGBA values in [0,1]
+
+    colors = np.array(colors)
+    print(colors.shape) 
+    # Ensure colors shape matches positions (N, 4)
+    positions_np = positions.detach().cpu().numpy()
+
+    # Create your render context and update scatter data
+    context = RenderContext(point_size=7)
+    context.scatter.set_data(positions_np, face_color=colors, size=context.point_size)
+    app.run()
+    # Shape match visualisation
+
+    raise Exception
+    print(model.ray_oris.shape)
+    '''
+    # test_scenario(min_corners, max_corners, model.gaussian_model.normals, new_normals)
+
+    train_model(model=model, num_iterations=400)
     # Get spatial grid parameters
-    # Call optimized projection function
+    # Call optimized projection function            

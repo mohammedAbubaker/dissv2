@@ -1,8 +1,15 @@
-kernel_code = """
 extern "C" __global__ void ray_aabb_intersect_top16(
         const float* ray_ori, const float* ray_dir,
         const float* min_corners, const float* max_corners,
         int* out_indices, int num_rays, int num_boxes);
+
+__global__ void get_depth_values(
+        const float* ray_ori, 
+        const float* ray_dir,
+        const float* min_corners, const float* max_corners,
+        float* out_depth, int num_rays, int num_boxes
+    );
+
 
 __global__ void ray_aabb_intersect_top16(
     const float* ray_ori,    // [R, 3] ray origins
@@ -99,4 +106,3 @@ __global__ void ray_aabb_intersect_top16(
         out_indices[ray_idx * 32 + i] = top_idx[i];
     }
 }
-"""

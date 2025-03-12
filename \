@@ -1,0 +1,978 @@
+from plyfile import PlyData, PlyElement
+import torch.autograd.profiler as profiler
+from torch.utils.data import TensorDataset, DataLoader
+import math
+import torch as to
+import torch.nn as nn
+import numpy as np
+
+from plyfile import PlyData
+
+import pandas as pd
+from vispy import scene, app
+
+from tqdm import tqdm
+device = "cuda"
+
+
+def broadcast(gauss_batch, ray_batch):
+    # Split up gauss_batch
+    means, covariances, opacities, normals, reference_normals = gauss_batch
+    # Split up ray_batch
+    ray_oris, ray_dirs = ray_batch
+
+    R = ray_oris.shape[0]
+    G = means.shape[0]
+
+    bcast_ray_oris = ray_oris.unsqueeze(1)
+    # (N_, dim=1rays, 1, 3)
+    bcast_ray_dirs = ray_dirs.unsqueeze(1)
+    # (1, N_gaussians, 3)
+    bcast_means = means.unsqueeze(0)
+    # (1, N_gaussians, 3)
+    bcast_covariances = covariances.unsqueeze(0)
+    # (1, N_gaussians)
+    bcast_opacities = opacities.unsqueeze(0)
+    # (1, N_gaussians, 3)
+    bcast_normals = normals.unsqueeze(0)
+    # (1, N_gaussians, 3)
+    bcast_reference_normals = reference_normals.unsqueeze(0)
+
+    return (
+        bcast_means,
+        bcast_covariances,
+        bcast_opacities,
+        bcast_normals,
+        bcast_reference_normals,
+        bcast_ray_oris,
+        bcast_ray_dirs
+    )
+
+
+def generate_icosphere_rays(center, radius, subdivision_level=1):
+    """
+    Generate rays from an icosahedron with subdivisions.
+
+    Args:
+    center: The center point of the sphere (to tensor of shape [3])
+    radius: The radius of the sphere
+    subdivision_level: Number of times to subdivide the icosahedron
+
+    Returns:
+    ray_oris: Ray origins on the sphere surface
+    ray_dirs: Ray directions (normalized vectors pointing outward from center)
+    """
+    # Define the initial icosahedron vertices
+    # Golden ratio for icosahedron construction
+    t = (1.0 + np.sqrt(5.0)) / 2.0
+
+    # Initial vertices of icosahedron
+    vertices = to.tensor([
+        [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
+        [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
+        [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]
+    ], dtype=to.float32)
+
+    # Normalize vertices to lie on a unit sphere
+    vertices = vertices / to.linalg.norm(vertices, dim=1, keepdim=True)
+
+    # Define the faces of the icosahedron as triplets of vertex indices
+    faces = to.tensor([
+        [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+        [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+        [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+        [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]
+    ], dtype=to.int64)
+
+    # Perform subdivision
+    for _ in range(subdivision_level):
+        new_faces = []
+
+        for face in faces:
+            v1, v2, v3 = vertices[face[0]
+                                  ], vertices[face[1]], vertices[face[2]]
+
+            # Create new vertices at the midpoints
+            v12 = (v1 + v2) / 2.0
+            v23 = (v2 + v3) / 2.0
+            v31 = (v3 + v1) / 2.0
+
+            # Normalize the new vertices to lie on the unit sphere
+            v12 = v12 / to.linalg.norm(v12)
+            v23 = v23 / to.linalg.norm(v23)
+            v31 = v31 / to.linalg.norm(v31)
+
+            # Add the new vertices
+            idx_v12 = len(vertices)
+            idx_v23 = len(vertices) + 1
+            idx_v31 = len(vertices) + 2
+            vertices = to.vstack((vertices, v12, v23, v31))
+
+            # Create four new faces
+            new_faces.append(to.tensor([face[0], idx_v12, idx_v31]))
+            new_faces.append(to.tensor([face[1], idx_v23, idx_v12]))
+            new_faces.append(to.tensor([face[2], idx_v31, idx_v23]))
+            new_faces.append(to.tensor([idx_v12, idx_v23, idx_v31]))
+
+        faces = to.stack(new_faces)
+
+    # Scale vertices by radius
+    ray_oris = vertices * radius
+
+    # Add center offset
+    ray_oris = ray_oris + center
+
+    # Ray directions pointing outward from the center
+    ray_dirs = ray_oris - center
+    # Normalize ray directions
+    ray_dirs = ray_dirs / to.linalg.norm(ray_dirs, dim=1, keepdim=True)
+
+    return ray_oris, ray_dirs
+
+
+def generate_fibonacci_sphere_rays(center, radius, n):
+    """
+    Generate rays using Fibonacci sphere sampling with PyTorch vectorization.
+
+    Args:
+        center: The center point of the sphere (to tensor of shape [3])
+        radius: The radius of the sphere
+        n: Number of points/rays to generate
+
+    Returns:
+        ray_oris: Ray origins on the sphere surface
+        ray_dirs: Ray directions (normalized vectors pointing outward from center)
+    """
+    # Create indices tensor
+    indices = to.arange(0, n, dtype=to.float32)
+
+    # Calculate z coordinates (vectorized)
+    z = 1 - (2 * indices) / (n - 1) if n > 1 else to.zeros(1)
+
+    # Calculate radius at each height (vectorized)
+    r = to.sqrt(1 - z * z)
+
+    # Golden ratio for Fibonacci spiral
+    phi = (1 + math.sqrt(5)) / 2
+
+    # Calculate theta (vectorized)
+    theta = 2 * math.pi * indices / phi
+
+    # Calculate x and y coordinates (vectorized)
+    x = r * to.cos(theta)
+    y = r * to.sin(theta)
+
+    # Stack to create ray origins
+    ray_oris = to.stack([x, y, z], dim=1)
+
+    # Scale by radius
+    ray_oris = ray_oris * radius
+
+    # Add center offset
+    ray_oris = ray_oris + center
+
+    # Ray directions pointing outward from the center
+    ray_dirs = ray_oris - center
+
+    # Normalize ray directions
+    ray_dirs = ray_dirs / to.linalg.norm(ray_dirs, dim=1, keepdim=True)
+
+    return ray_oris, ray_dirs
+
+
+def generate_sphere_rays(center, radius, n):
+    # Generate random angles for spherical coordinates
+    theta = to.rand(n, 1) * 2 * to.pi  # Azimuthal angle
+    phi = to.rand(n, 1) * to.pi        # Polar angle
+
+    # Spherical to Cartesian conversion
+    x = radius * to.sin(phi) * to.cos(theta)
+    y = radius * to.sin(phi) * to.sin(theta)
+    z = radius * to.cos(phi)
+
+    # Combine into ray origins
+    ray_oris = to.hstack((x, y, z))
+
+    # Ray directions pointing outward from the center
+    ray_dirs = ray_oris - center
+    # Normalise ray dirs
+    ray_dirs = ray_dirs / to.linalg.norm(ray_dirs)
+
+    return ray_oris, ray_dirs
+
+
+def compute_pairwise_great_circle(points, radius=1.0):
+    # Normalize points to lie on the unit sphere
+    points_normalized = points / points.norm(dim=1, keepdim=True)
+    # Compute the pairwise dot product; for unit vectors, this equals cos(theta)
+    dot_prod = to.mm(points_normalized, points_normalized.t())
+    # Clamp to ensure numerical stability
+    dot_prod = to.clamp(dot_prod, -1.0, 1.0)
+    # Compute the great circle distance (angle in radians)
+    distances = to.acos(dot_prod)
+    # Scale by the sphere's radius if needed
+    return distances * radius
+
+
+def compute_graph_laplacian(points, sigma, radius=1.0):
+    # Compute pairwise great circle distances
+    distances = compute_pairwise_great_circle(points, radius)
+    # Create weight matrix using a Gaussian kernel
+    W = to.exp(-distances**2 / (2 * sigma**2))
+    # Optionally, remove self-loops by zeroing out the diagonal
+    W.fill_diagonal_(0)
+    # Compute degree matrix
+    D = to.diag(W.sum(dim=1))
+    # Graph Laplacian: L = D - W
+    L = D - W
+    return L
+
+
+def quaternion_to_rotation_matrix(quaternions):
+    x = quaternions[:, 1]
+    y = quaternions[:, 2]
+    z = quaternions[:, 3]
+    w = quaternions[:, 0]
+
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    xw = x * w
+    yw = y * w
+    zw = z * w
+
+    n = quaternions.shape[0]
+    R = to.empty((n, 3, 3), dtype=quaternions.dtype)
+
+    R[:, 0, 0] = 1 - 2 * (yy + zz)
+    R[:, 0, 1] = 2 * (xy - zw)
+    R[:, 0, 2] = 2 * (xz + yw)
+    R[:, 1, 0] = 2 * (xy + zw)
+    R[:, 1, 1] = 1 - 2 * (xx + zz)
+    R[:, 1, 2] = 2 * (yz - xw)
+    R[:, 2, 0] = 2 * (xz - yw)
+    R[:, 2, 1] = 2 * (yz + xw)
+    R[:, 2, 2] = 1 - 2 * (xx + yy)
+
+    return R
+
+
+class GaussianModel:
+    def __init__(self, path):
+        self.path = path  # store original path for later saving
+        # Load in data
+        plyfile = PlyData.read(path)
+        plydata = plyfile['vertex'].data
+        df = pd.DataFrame(plydata)
+        means_mask = ["x", "y", "z"]
+        quaternions_mask = ["rot_0", "rot_1", "rot_2", "rot_3"]
+        scales_mask = ["scale_0", "scale_1", "scale_2"]
+        opacities_mask = ["opacity"]
+
+        self.means = to.tensor(df[means_mask].values).to(device)
+        self.quaternions = to.tensor(df[quaternions_mask].values).to(device)
+        self.scales = to.tensor(df[scales_mask].values).to(device)
+        self.opacities = to.tensor(df[opacities_mask].values).to(device)
+
+        self.n_gaussians = plydata.shape[0]
+
+        # (repeat loading of data, activation, etc.)
+        self.opacities = 1 / (1 + to.exp(-self.opacities))
+        self.normalised_quaternions = self.quaternions / \
+            to.linalg.norm(self.quaternions)
+        self.rotations = quaternion_to_rotation_matrix(
+            self.normalised_quaternions).to(device)
+        self.scales_exp = to.exp(self.scales)
+        self.scales_d = to.eye(3)[None, :, :].to(
+            device) * (self.scales_exp)[:, :, None]
+        self.scales_d **= 2
+        self.scales_i_d = to.eye(3)[None, :, :].to(
+            device) * (1/self.scales_exp)[:, :, None]
+        self.scales_i_d **= 2
+        self.rotations_t = self.rotations.transpose(-1, -2)
+        self.scales_d_t = self.scales_d.transpose(-1, -2)
+        self.covariances = self.rotations @ self.scales_d @ self.rotations_t
+
+        min_indices = self.scales_exp.argmin(axis=1)
+        self.normals = self.rotations[to.arange(
+            self.n_gaussians), :, min_indices]
+        self.normals = self.normals / to.linalg.norm(self.normals)
+        centroid = self.means.mean(dim=0)
+        vectors_to_centroid = centroid - self.means
+        dot_products = (vectors_to_centroid * self.normals).sum(dim=1)
+        flip_mask = dot_products < 0
+        self.normals[flip_mask] = -self.normals[flip_mask]
+        self.reference_normals = self.normals
+
+
+def evaluate_points(points, gaussian_means, gaussian_inv_covs, gaussian_opacities):
+    distance_to_mean = points - gaussian_means
+    exponent = -0.5 * (distance_to_mean[:, :, None, :]
+                       @ gaussian_inv_covs @ distance_to_mean[..., None])
+    evaluations = gaussian_opacities * to.exp(exponent).squeeze(-1)
+    return evaluations
+
+
+def skew_symmetric(v):
+    row1 = to.stack([to.zeros_like(v[..., 0]), -v[..., 2], v[..., 1]], dim=-1)
+    row2 = to.stack([v[..., 2], to.zeros_like(v[..., 1]), -v[..., 0]], dim=-1)
+    row3 = to.stack([-v[..., 1], v[..., 0], to.zeros_like(v[..., 2])], dim=-1)
+    K = to.stack([row1, row2, row3], dim=-2)
+    return K
+
+
+def normals_to_rot_matrix_2(a, b):
+    # a and b are assumed to be unit vectors (with shape [..., 3])
+    # Compute the angle between a and b
+    a_dot_b = (a * b).sum(dim=-1, keepdim=True)  # shape [..., 1]
+    theta = to.acos(to.clamp(a_dot_b, -1.0, 1.0))
+
+    # Compute the normalized cross product (rotation axis)
+    v = to.cross(a, b)
+    v_norm = to.norm(v, dim=-1, keepdim=True)
+    # To avoid division by zero, add a small epsilon
+    eps = 1e-8
+    v_unit = v / (v_norm + eps)
+
+    # Build the skew-symmetric matrix from the normalized axis
+    K = skew_symmetric(v_unit)
+
+    # Rodrigues formula: R = I + sin(theta)*K + (1 - cos(theta)) * K^2
+    I = to.eye(3, device=a.device).expand(a.shape[:-1] + (3, 3))
+    sin_theta = to.sin(theta)[..., None]
+    cos_theta = to.cos(theta)[..., None]
+
+    R = I + sin_theta * K + (1 - cos_theta) * (K @ K)
+    return R
+
+
+def axis_angle_to_quaternion(axis, angle):
+    """Convert an axis-angle rotation to a quaternion.
+    Axis should be normalized.
+    Returns a quaternion in (w, x, y, z) order.
+    """
+    print(axis.shape)
+    print(angle.shape)
+    half_angle = angle / 2.0
+    w = to.cos(half_angle)
+    xyz = axis * to.sin(half_angle)
+    return to.cat([w, xyz], dim=-1)
+
+
+def compute_difference_quaternion(ref_normals, current_normals, eps=1e-8):
+    """Compute the quaternion that rotates ref_normals to current_normals.
+    Both inputs are assumed to be normalized and of shape (N, 3).
+    Returns a tensor of shape (N, 4) representing quaternions in (w, x, y, z) order.
+    """
+    # Compute the dot product and clamp for stability.
+    dot = to.clamp((ref_normals * current_normals).sum(dim=-1), -1.0, 1.0)
+    angle = to.acos(dot)
+
+    # Compute the rotation axis.
+    axis = to.cross(ref_normals, current_normals)
+    axis_norm = to.norm(axis, dim=-1, keepdim=True)
+    # Avoid division by zero by providing a default axis when the norm is very small.
+    axis = to.where(axis_norm < eps, to.tensor(
+        [1.0, 0.0, 0.0], device=axis.device).expand_as(axis), axis / (axis_norm + eps))
+
+    return axis_angle_to_quaternion(axis, angle[..., None])
+
+
+def quaternion_multiply(q, r):
+    """
+    Multiply two quaternions.
+    Both q and r are tensors of shape (..., 4) in (w, x, y, z) order.
+    Returns their product.
+    """
+    w1, x1, y1, z1 = q.unbind(dim=-1)
+    w2, x2, y2, z2 = r.unbind(dim=-1)
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    return to.stack([w, x, y, z], dim=-1)
+
+
+def normals_to_rot_matrix(a, b):
+    # Given 2 RxNx3 vectors a and b, return an RxNx3x3 rotation matrix
+    a_dot_b = (a[:, :, None, :] @ b[..., None]).squeeze(-1).squeeze(-1)
+    a_norm = to.linalg.norm(a)
+    b_norm = to.linalg.norm(b, dim=2)
+    angle = to.acos((a_dot_b / (a_norm * b_norm)))
+    v = to.cross(a, b)
+    s = to.norm(v, dim=2) * to.sin(angle)
+    c = a_dot_b * to.cos(angle)
+    i = to.eye(3).to(device).tile(a.shape[0], a.shape[1], 1, 1)
+    v_skew = skew_symmetric(v)
+    last_term = 1 / (1 + c)
+    return i + v_skew + (v_skew @ v_skew) * last_term[..., None, None]
+
+
+def get_max_responses_and_tvals(
+    ray_oris,
+    means,
+    covs,
+    ray_dirs,
+    opacities,
+    normals,
+    old_normals
+):
+    new_rotations = normals_to_rot_matrix(old_normals, normals)
+    new_covs = new_rotations @ covs @ new_rotations.transpose(-2, -1)
+    inv_covs = to.linalg.inv(new_covs)
+    rg_diff = means - ray_oris
+    inv_cov_d = inv_covs @ ray_dirs[..., None]
+    numerator = (rg_diff[:, :, None, :] @ inv_cov_d).squeeze(-1)
+    denomenator = (ray_dirs[:, :, None, :] @ inv_cov_d).squeeze(-1)
+    t_values = numerator / denomenator
+    best_positions = (ray_oris + t_values * ray_dirs)
+    max_responses = evaluate_points(best_positions, means, inv_covs, opacities)
+
+    return max_responses, t_values
+
+
+class GaussianParameters(nn.Module):
+    def __init__(self, path):
+        super(GaussianParameters, self).__init__()
+        self.gaussian_model = GaussianModel(path)
+        self.means = nn.Parameter(self.gaussian_model.means)
+        self.normals = nn.Parameter(self.gaussian_model.normals)
+        ray_oris, ray_dirs = generate_fibonacci_sphere_rays(
+            to.tensor([0.0, 0.0, 0.0]), 10, 1000)
+        self.ray_oris = ray_oris.to(device)
+        self.ray_dirs = ray_dirs.to(device)
+        self.laplacian = compute_graph_laplacian(ray_oris, 1, 10).to(device)
+        self.spatial_hash_ext = load(
+            name="spatial_hash_grid_ext",
+            sources=["spatial_hash_grid_kernel.cu"],
+            verbose=True
+        )
+ 
+
+    def forward(self):
+        return self.means, self.normals
+
+    def project_with_spatial_hash(self, spatial_hash_ext, cell_size, grid_min, nx, ny, nz,
+                                  cell_start, cell_count, cell_indices):
+        """
+        Use the spatial hash grid CUDA kernel to retrieve candidate gaussian indices per ray,
+        then compute per-ray sparse contribution weights.
+
+        Args:
+            spatial_hash_ext: The loaded CUDA extension (with function spatial_hash_grid_query)
+            cell_size: (float) Grid cell size.
+            grid_min: (tuple of 3 floats) Minimum (x, y, z) of the grid.
+            nx, ny, nz: (int) Number of cells along each axis.
+            cell_start: Tensor of shape [nx*ny*nz] with starting indices for each cell.
+            cell_count: Tensor of shape [nx*ny*nz] with counts for each cell.
+            cell_indices: Tensor of shape [total_candidates] with concatenated gaussian indices.
+
+        Returns:
+            sparse_contribution: A sparse tensor of shape [N_rays, N_gaussians] where nonzero entries
+                                 represent contribution weights from a gaussian to a given ray.
+            blended_tvals: A tensor of shape [N_rays] representing the weighted t-values.
+        """
+        # 1. Retrieve candidate gaussian indices per ray using your CUDA extension.
+
+
+        #    Candidate indices will have shape [N_rays, 16]. Entries with -1 indicate an empty slot.
+
+        cell_start = cell_start.to(dtype=to.int32)
+        cell_count = cell_count.to(dtype=to.int32)
+        cell_indices = cell_indices.to(dtype=to.int32)
+
+        candidate_indices = self.spatial_hash_ext.spatial_hash_grid_query(
+            self.ray_oris,  # [N_rays, 3] (float32, CUDA)
+            self.ray_dirs,  # [N_rays, 3] (float32, CUDA)
+            self.ray_oris.shape[0],
+            cell_size,
+            grid_min[0], 
+            grid_min[1], 
+            grid_min[2],
+            nx,
+            ny,
+            nz,
+            cell_start,
+            cell_count,
+            cell_indices
+        )[0]
+        candidate_indices = candidate_indices.long()
+
+        # Create a mask for valid candidate indices.
+        valid_mask = candidate_indices >= 0  # shape: [N_rays, 16]
+        # Clamp indices so we can use them for indexing (invalid ones become 0; we will mask later).
+        candidate_indices_clamped = candidate_indices.clamp(min=0)
+
+        # 2. Gather gaussian parameters for each candidate.
+        #    These tensors are of shape [N_rays, 16, ...].
+        # [N_rays, 16, 3]
+        candidate_means = self.means[candidate_indices_clamped]
+        # [N_rays, 16, 3, 3]
+        candidate_covariances = self.gaussian_model.covariances[candidate_indices_clamped]
+        # [N_rays, 16]
+        candidate_opacities = self.gaussian_model.opacities[candidate_indices_clamped]
+        # [N_rays, 16, 3]
+        candidate_normals = self.normals[candidate_indices_clamped]
+        # [N_rays, 16, 3]
+        candidate_ref_normals = self.gaussian_model.reference_normals[candidate_indices_clamped]
+
+        # 3. Expand ray origins/directions to candidate level.
+        ray_oris_exp = self.ray_oris.unsqueeze(
+            1).expand(-1, 16, -1)  # [N_rays, 16, 3]
+        ray_dirs_exp = self.ray_dirs.unsqueeze(
+            1).expand(-1, 16, -1)  # [N_rays, 16, 3]
+
+        # 4. Compute candidate responses (alpha values and t-values) using your intersection routine.
+        candidate_alphas, candidate_tvals = get_max_responses_and_tvals(
+            ray_oris_exp,
+            candidate_means,
+            candidate_covariances,
+            ray_dirs_exp,
+            candidate_opacities,
+            candidate_normals,
+            candidate_ref_normals
+        )  # Both outputs are [N_rays, 16]
+
+        # Set responses for invalid candidates (so they do not contribute)
+        valid_mask = valid_mask[..., None]
+        candidate_alphas = candidate_alphas * valid_mask.to(candidate_alphas.dtype) + \
+            (1 - valid_mask.to(candidate_alphas.dtype))
+
+        # 5. Sort candidates along each ray by t-value.
+        sorted_tvals, sorted_idx = candidate_tvals.sort(dim=1)
+        sorted_alphas = candidate_alphas.gather(dim=1, index=sorted_idx)
+
+        # Compute cumulative transmittance and contributions along the sorted candidates.
+        alphas_complement = 1 - sorted_alphas
+        transmittance = to.cumprod(alphas_complement, dim=1)
+        # Shift transmittance to obtain the contribution from each candidate.
+        shifted = to.ones_like(transmittance)
+        shifted[:, 1:] = transmittance[:, :-1]
+        sorted_contributions = shifted - transmittance
+
+        # Normalize contributions (avoid division by zero).
+        norm_factor = sorted_contributions.sum(dim=1, keepdim=True)
+        sorted_contributions = sorted_contributions / (norm_factor + 1e-8)
+
+        # Revert the sorted order to the original candidate order.
+        inv_idx = sorted_idx.argsort(dim=1)
+        contributions = sorted_contributions.gather(
+            dim=1, index=inv_idx)  # [N_rays, 16]
+
+        # 6. Build a sparse contribution matrix.
+        #    For each ray, assign the contribution weight to the corresponding gaussian index.
+        N_rays = self.ray_oris.shape[0]
+        N_gaussians = self.means.shape[0]
+        # Get indices of valid candidate positions.
+        # each row: [ray_idx, candidate_position]
+        valid_candidates = valid_mask.nonzero(as_tuple=False)
+        ray_idx_valid = valid_candidates[:, 0]
+        candidate_pos = valid_candidates[:, 1]
+        # Retrieve corresponding gaussian indices.
+        gaussian_idx_valid = candidate_indices[ray_idx_valid, candidate_pos]
+        # And the contribution values.
+        contribution_values = contributions[ray_idx_valid, candidate_pos]
+
+        # Create a sparse tensor (COO format) of size [N_rays, N_gaussians].
+        indices = to.stack([ray_idx_valid, gaussian_idx_valid], dim=0)
+
+        # Optionally compute a blended t-value per ray (weighted sum over candidates).
+        blended_tvals = (contributions * candidate_tvals).sum(dim=1)
+
+        # Optionally, you might want to save these results as attributes:
+        # dense contributions per ray/candidate slot.
+        self.candidate_contributions = contributions
+        self.blended_tvals = blended_tvals
+
+        return contributions, blended_tvals, candidates
+
+    def project(self):
+        gaussian_dataset = TensorDataset(
+            self.means,
+            self.gaussian_model.covariances,
+            self.gaussian_model.opacities,
+            self.normals,
+            self.gaussian_model.reference_normals
+        )
+        rays_dataset = TensorDataset(
+            self.ray_oris,
+            self.ray_dirs
+        )
+
+        gaussian_generator = DataLoader(gaussian_dataset, batch_size=1000)
+        ray_generator = DataLoader(rays_dataset, batch_size=1000)
+
+        self.contributions = []
+        self.tvals = []
+        for ray_batch in ray_generator:
+            self.tvals_along_ray = []
+            self.alphas_along_ray = []
+            for gauss_batch in gaussian_generator:
+                (bcast_means,
+                 bcast_covariances,
+                 bcast_opacities,
+                 bcast_normals,
+                 bcast_reference_normals,
+                 bcast_ray_oris,
+                 bcast_ray_dirs) = broadcast(gauss_batch, ray_batch)
+
+                batch_alphas, batch_tvals = get_max_responses_and_tvals(
+                    bcast_ray_oris,
+                    bcast_means,
+                    bcast_covariances,
+                    bcast_ray_dirs,
+                    bcast_opacities,
+                    bcast_normals,
+                    bcast_reference_normals 
+                )
+                self.tvals_along_ray.append(batch_tvals)
+                self.alphas_along_ray.append(batch_alphas)
+
+            self.tvals_along_ray = to.cat(self.tvals_along_ray, dim=1)
+            self.tvals.append(self.tvals_along_ray)
+            self.alphas_along_ray = to.cat(self.alphas_along_ray, dim=1)
+
+            _, sorted_idx = to.sort(self.tvals_along_ray, dim=1)
+            sorted_alphas = self.alphas_along_ray.gather(
+                dim=1, index=sorted_idx)
+            alphas_compliment = 1 - sorted_alphas
+            transmittance = to.cumprod(alphas_compliment, dim=1)
+            shifted = to.ones_like(transmittance)
+            # Fill shifted starting from the second column with the values of x's columns 0 to N-2
+            shifted[:, 1:] = transmittance[:, :-1]
+            # Calculate contribution
+            sorted_contribution = shifted - transmittance
+            # Normalise
+            norm_factor = to.sum(sorted_contribution, dim=1)[..., None]
+            sorted_contribution = sorted_contribution / norm_factor
+            # unsort the contribution
+            inv_idx = sorted_idx.argsort(dim=1)
+            # Reorder contribution back to the original order:
+            contribution = sorted_contribution.gather(dim=1, index=inv_idx)
+            self.contributions.append(contribution)
+        self.tvals = to.cat(self.tvals, dim=1)
+        self.contributions = to.cat(self.contributions, dim=1)
+        self.blended_tvals = to.sum(self.contributions * self.tvals, dim=1)
+        return self.blended_tvals
+
+    def harmonic_loss_v2(self):
+        """
+        Compute the harmonic loss by first determining an optimal grid for your gaussian means,
+        building the spatial hash grid, and then using it to compute a sparse contribution matrix
+        via project_with_spatial_hash.
+        
+        Args:
+            spatial_hash_ext: The loaded CUDA extension with function spatial_hash_grid_query.
+        
+        Returns:
+            loss: The harmonic loss computed as blended_tvals^T @ laplacian @ blended_tvals.
+        """
+
+        # 1. Compute the bounding box of the gaussian means with a LARGER margin
+        bounds_min, _ = self.means.min(dim=0)
+        bounds_max, _ = self.means.max(dim=0)
+        
+        # Increase margin from 5% to 20% to ensure rays originating outside the bounds can still intersect
+        margin = 0.2 * (bounds_max - bounds_min)
+        grid_min = bounds_min - margin
+        grid_max = bounds_max + margin
+        grid_size = grid_max - grid_min
+        
+        # Use a smaller cell size for better precision (adjust based on your data)
+        # Instead of dividing by 10, try dividing by a smaller number (e.g., 5)
+        avg_extent = grid_size.mean()
+        cell_size = avg_extent / 5.0
+        
+        # Print debug info about grid configuration
+        # 3. Compute the grid resolution
+        nx = int(to.ceil(grid_size[0] / cell_size).item())
+        ny = int(to.ceil(grid_size[1] / cell_size).item())
+        nz = int(to.ceil(grid_size[2] / cell_size).item())
+        total_cells = nx * ny * nz
+
+        # 4. For each gaussian, compute its cell index.
+        gaussian_cells = ((self.means - grid_min) / cell_size).floor().to(to.int32)
+        # Clamp to ensure indices are within grid bounds.
+        gaussian_cells[:, 0].clamp_(0, nx - 1)
+        gaussian_cells[:, 1].clamp_(0, ny - 1)
+        gaussian_cells[:, 2].clamp_(0, nz - 1)
+        linear_indices = (gaussian_cells[:, 0] +
+                          gaussian_cells[:, 1] * nx +
+                          gaussian_cells[:, 2] * nx * ny)
+
+        # 5. Build cell_count using bincount.
+        cell_count = to.bincount(linear_indices, minlength=total_cells).to(to.int32).to(device)
+
+        # 6. Build cell_start: for each cell, store the start index in the sorted candidate list.
+        cell_start = to.zeros(total_cells, dtype=to.int32, device=device)
+        if total_cells > 0:
+            cell_start[1:] = to.cumsum(cell_count, dim=0)[:-1]
+
+        # 7. Sort gaussian indices by cell.
+        sorted_linear_indices, sort_order = linear_indices.sort()
+        sorted_gaussian_indices = to.arange(self.means.shape[0], device=device)[sort_order]
+        cell_indices = sorted_gaussian_indices  # This is our flattened candidate list.
+
+        # 8. Now call your projection function that uses the spatial hash grid.
+        # Convert grid_min to a Python list/tuple of floats.
+        grid_min_list = grid_min.cpu().tolist()
+     
+        sparse_contrib, blended_tvals = self.project_with_spatial_hash(
+            self.spatial_hash_ext,
+            cell_size,
+            grid_min_list,
+            nx, ny, nz,
+            cell_start, 
+            cell_count, 
+            cell_indices
+        )
+
+        # 9. Compute the harmonic loss based on the blended t-values per ray.
+        # Here we assume blended_tvals is a [N_rays] tensor.
+        loss = blended_tvals.T @ self.laplacian @ blended_tvals
+        return loss
+
+    def harmonic_loss(self):
+        projected_values = self.project()
+        loss = projected_values.T @ self.laplacian @ projected_values
+        return loss
+
+
+class RenderContext:
+    def __init__(self, point_size=5, fov=45, distance=10):
+        # Create a Vispy canvas with an interactive background.
+        self.canvas = scene.SceneCanvas(
+            keys='interactive', show=True, bgcolor='black')
+        self.view = self.canvas.central_widget.add_view()
+        # Use a TurntableCamera for 3D interaction.
+        self.view.camera = scene.cameras.TurntableCamera(
+            fov=fov, distance=distance)
+        # Create a scatter visual to display points.
+        self.scatter = scene.visuals.Markers(parent=self.view.scene)
+        # Initialize with an empty dataset.
+        self.scatter.set_data(np.empty((0, 3)),
+                              edge_color=None,
+                              face_color=(1, 1, 1, 1),
+                              size=point_size)
+        self.point_size = point_size
+
+    def update(self, positions, blended_tvals):
+        """
+        Update the scatter plot with new 3D positions and color them based on blended_tvals.
+
+        Parameters:
+            positions (np.ndarray): An (N, 3) array of 3D coordinates.
+            blended_tvals (np.ndarray): A length-N array of scalar values for color mapping.
+        """
+        if positions is None or positions.size == 0:
+            return
+
+        # Ensure positions is of shape (N, 3)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            raise ValueError("positions must be a numpy array of shape (N, 3)")
+
+        # Map blended_tvals to colors if provided.
+        if blended_tvals is not None and len(blended_tvals) == positions.shape[0]:
+            min_val = np.min(blended_tvals)
+            max_val = np.max(blended_tvals)
+            range_val = max_val - min_val if max_val != min_val else 1.0
+            normalized = (blended_tvals - min_val) / range_val
+
+            # Simple blue-to-red colormap:
+            colors = np.empty((positions.shape[0], 4), dtype=np.float32)
+            colors[:, 0] = normalized[:, 0]         # Red increases with value.
+            colors[:, 1] = 0.2                # Fixed green for consistency.
+            # Blue decreases with value.
+            colors[:, 2] = 1 - normalized[:, 0]
+            colors[:, 3] = 1.0                # Fully opaque.
+        else:
+            # Default to white if no valid scalar values are provided.
+            colors = np.tile(
+                np.array([1, 1, 1, 1], dtype=np.float32), (positions.shape[0], 1))
+
+        # Update scatter plot data.
+        self.scatter.set_data(
+            positions, face_color=colors, size=self.point_size)
+        self.canvas.update()
+        # Process pending GUI events to refresh the display immediately.
+        app.process_events()
+
+
+def matrix_to_quaternion(rotation_matrices):
+    N = rotation_matrices.shape[0]
+    q = to.zeros((N, 4), device=rotation_matrices.device)
+
+    trace = to.einsum('nii->n', rotation_matrices)
+
+    cond1 = trace > 0
+    cond2 = (rotation_matrices[:, 0, 0] > rotation_matrices[:, 1, 1]) & ~cond1
+    cond3 = (rotation_matrices[:, 1, 1] >
+             rotation_matrices[:, 2, 2]) & ~(cond1 | cond2)
+    cond4 = ~(cond1 | cond2 | cond3)
+
+    S = to.zeros_like(trace)
+    S[cond1] = to.sqrt(trace[cond1] + 1.0) * 2
+    q[cond1, 0] = 0.25 * S[cond1]
+    q[cond1, 1] = (rotation_matrices[cond1, 2, 1] -
+                   rotation_matrices[cond1, 1, 2]) / S[cond1]
+    q[cond1, 2] = (rotation_matrices[cond1, 0, 2] -
+                   rotation_matrices[cond1, 2, 0]) / S[cond1]
+    q[cond1, 3] = (rotation_matrices[cond1, 1, 0] -
+                   rotation_matrices[cond1, 0, 1]) / S[cond1]
+
+    S[cond2] = to.sqrt(1.0 + rotation_matrices[cond2, 0, 0] -
+                       rotation_matrices[cond2, 1, 1] - rotation_matrices[cond2, 2, 2]) * 2
+    q[cond2, 0] = (rotation_matrices[cond2, 2, 1] -
+                   rotation_matrices[cond2, 1, 2]) / S[cond2]
+    q[cond2, 1] = 0.25 * S[cond2]
+    q[cond2, 2] = (rotation_matrices[cond2, 0, 1] +
+                   rotation_matrices[cond2, 1, 0]) / S[cond2]
+    q[cond2, 3] = (rotation_matrices[cond2, 0, 2] +
+                   rotation_matrices[cond2, 2, 0]) / S[cond2]
+
+    S[cond3] = to.sqrt(1.0 + rotation_matrices[cond3, 1, 1] -
+                       rotation_matrices[cond3, 0, 0] - rotation_matrices[cond3, 2, 2]) * 2
+    q[cond3, 0] = (rotation_matrices[cond3, 0, 2] -
+                   rotation_matrices[cond3, 2, 0]) / S[cond3]
+    q[cond3, 1] = (rotation_matrices[cond3, 0, 1] +
+                   rotation_matrices[cond3, 1, 0]) / S[cond3]
+    q[cond3, 2] = 0.25 * S[cond3]
+    q[cond3, 3] = (rotation_matrices[cond3, 1, 2] +
+                   rotation_matrices[cond3, 2, 1]) / S[cond3]
+
+    S[cond4] = to.sqrt(1.0 + rotation_matrices[cond4, 2, 2] -
+                       rotation_matrices[cond4, 0, 0] - rotation_matrices[cond4, 1, 1]) * 2
+    q[cond4, 0] = (rotation_matrices[cond4, 1, 0] -
+                   rotation_matrices[cond4, 0, 1]) / S[cond4]
+    q[cond4, 1] = (rotation_matrices[cond4, 0, 2] +
+                   rotation_matrices[cond4, 2, 0]) / S[cond4]
+    q[cond4, 2] = (rotation_matrices[cond4, 1, 2] +
+                   rotation_matrices[cond4, 2, 1]) / S[cond4]
+    q[cond4, 3] = 0.25 * S[cond4]
+
+    return q
+
+
+def rot_matrix_to_quaternions(R):
+    R = R[0, ...]
+    """
+    Convert an (n,3,3) batch of rotation matrices to (n,4) batch of quaternions.
+    Args:
+        R: to.Tensor of shape (n,3,3), where each (3,3) matrix is a rotation matrix.
+    
+    Returns:
+        to.Tensor of shape (n,4), where each quaternion is (w, x, y, z).
+    """
+    n = R.shape[0]
+
+    trace = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
+
+    q = to.zeros((n, 4), device=R.device)
+
+    # Case w is largest
+    w_large = trace > 0
+    if w_large.any():
+        S = to.sqrt(trace[w_large] + 1.0) * 2  # S=4w
+        q[w_large, 0] = 0.25 * S
+        q[w_large, 1] = (R[w_large, 2, 1] - R[w_large, 1, 2]) / S
+        q[w_large, 2] = (R[w_large, 0, 2] - R[w_large, 2, 0]) / S
+        q[w_large, 3] = (R[w_large, 1, 0] - R[w_large, 0, 1]) / S
+
+    # Case x is largest
+    x_large = (~w_large) & (R[:, 0, 0] > R[:, 1, 1]) & (
+        R[:, 0, 0] > R[:, 2, 2])
+    if x_large.any():
+        S = to.sqrt(1.0 + R[x_large, 0, 0] -
+                    R[x_large, 1, 1] - R[x_large, 2, 2]) * 2
+        q[x_large, 0] = (R[x_large, 2, 1] - R[x_large, 1, 2]) / S
+        q[x_large, 1] = 0.25 * S
+        q[x_large, 2] = (R[x_large, 0, 1] + R[x_large, 1, 0]) / S
+        q[x_large, 3] = (R[x_large, 0, 2] + R[x_large, 2, 0]) / S
+
+    # Case y is largest
+    y_large = (~w_large) & (~x_large) & (R[:, 1, 1] > R[:, 2, 2])
+    if y_large.any():
+        S = to.sqrt(1.0 + R[y_large, 1, 1] -
+                    R[y_large, 0, 0] - R[y_large, 2, 2]) * 2
+        q[y_large, 0] = (R[y_large, 0, 2] - R[y_large, 2, 0]) / S
+        q[y_large, 1] = (R[y_large, 0, 1] + R[y_large, 1, 0]) / S
+        q[y_large, 2] = 0.25 * S
+        q[y_large, 3] = (R[y_large, 1, 2] + R[y_large, 2, 1]) / S
+
+    # Case z is largest
+    z_large = ~(w_large | x_large | y_large)
+    if z_large.any():
+        S = to.sqrt(1.0 + R[z_large, 2, 2] -
+                    R[z_large, 0, 0] - R[z_large, 1, 1]) * 2
+        q[z_large, 0] = (R[z_large, 1, 0] - R[z_large, 0, 1]) / S
+        q[z_large, 1] = (R[z_large, 0, 2] + R[z_large, 2, 0]) / S
+        q[z_large, 2] = (R[z_large, 1, 2] + R[z_large, 2, 1]) / S
+        q[z_large, 3] = 0.25 * S
+
+    return q
+
+
+def save_optimized_gaussian_model(model, output_path="optimized_point_cloud.ply"):
+    """
+    Save the optimized Gaussian model to a new PLY file.
+    The saved file will have all columns identical to the original file,
+    except that the 'x', 'y', and 'z' columns (means) are updated with the 
+    final optimized values and the quaternion columns ('rot_0', 'rot_1', 
+    'rot_2', 'rot_3') are recomputed from the optimized normals.
+    """
+    # Re-read the original PLY file to preserve all columns and order.
+    original_ply = PlyData.read(model.gaussian_model.path)
+    original_data = original_ply['vertex'].data
+    df = pd.DataFrame(original_data)
+
+    # Update mean coordinates (x, y, z) with optimized values.
+    new_means = model.means.detach().cpu().numpy()  # shape (N, 3)
+    df['x'] = new_means[:, 0]
+    df['y'] = new_means[:, 1]
+    df['z'] = new_means[:, 2]
+
+    # Get rotation matrix that transforms old normals to new normals.
+    diff_rot = normals_to_rot_matrix(
+        model.gaussian_model.reference_normals[None, ...],
+        model.normals[None, ...]
+    ).squeeze(0)
+    # Convert the diff rot int a diff quat
+    diff_quats = matrix_to_quaternion(diff_rot)
+    # Apply the diff quats to new quaternioons
+    new_quats = quaternion_multiply(
+        diff_quats, model.gaussian_model.quaternions).detach().cpu().numpy()
+    df['rot_0'] = new_quats[:, 0]
+    df['rot_1'] = new_quats[:, 1]
+    df['rot_2'] = new_quats[:, 2]
+    df['rot_3'] = new_quats[:, 3]
+    # Convert the DataFrame back into a structured numpy array with the original dtype.
+    new_data = df.to_records(index=False)
+    # Create a PlyElement and write out a binary little-endian PLY file.
+    ply_element = PlyElement.describe(new_data, 'vertex')
+    PlyData([ply_element], text=False).write(output_path)
+
+
+def train_model(model, num_iterations=10000, lr=0.005):
+    optimizer = to.optim.Adam(model.parameters(), lr=lr)
+    context = RenderContext()
+    for iteration in tqdm(range(num_iterations)):
+        optimizer.zero_grad()
+        loss = model.harmonic_loss_v2()
+        loss.backward()
+        optimizer.step()
+        positions = (model.ray_oris + model.blended_tvals *
+                     model.ray_dirs).detach().cpu().numpy()
+        blended_tvals = model.blended_tvals.detach().cpu().numpy()
+        context.update(positions, blended_tvals)
+        # time.sleep(0.05)
+    save_optimized_gaussian_model(
+        model, output_path="optimized_point_cloud.ply")
+
+
+if __name__ == "__main__":
+    from torch.utils.cpp_extension import load
+    model = GaussianParameters("point_cloud.ply")
+    train_model(model=model, num_iterations=1000)
