@@ -1,3 +1,8 @@
+from matplotlib.colors import Normalize
+from scipy.spatial.transform import Rotation
+import scipy.sparse.linalg as spla
+import scipy.sparse as sp
+import torch.nn.functional as F
 import threading
 import cupy as cp
 import time
@@ -21,7 +26,8 @@ device = "cuda"
 module = cp.RawModule(code=kernel_code)
 kernel = module.get_function("ray_aabb_intersect_top16")
 
-def generate_rays_from_points(points, radius, keep_percentage=0.2                              ):
+
+def generate_rays_from_points(points, radius, keep_percentage=0.95):
     # Sample a subset of points if keep_percentage < 1.0
     num_points = points.shape[0]
     num_keep = int(num_points * keep_percentage)
@@ -34,14 +40,14 @@ def generate_rays_from_points(points, radius, keep_percentage=0.2               
 
     # Generate ray directions from the center to the selected points
     ray_dirs = selected_points - center
-    ray_dirs = ray_dirs / to.linalg.norm(ray_dirs, dim=1, keepdim=True)
+    ray_dirs = ray_dirs / to.norm(ray_dirs, dim=1, keepdim=True)
 
     # Compute ray origins
     ray_oris = center + ray_dirs * radius
     return ray_oris, -1.0 * ray_dirs
 
 
-def generate_fibonacci_sphere_rays(center, radius, n, jitter_scale=0.03):
+def generate_fibonacci_sphere_rays(center, radius, n, jitter_scale=0.4):
     """
     Generate rays using Fibonacci sphere sampling with PyTorch vectorization.
     Adds random jitter to ray directions for more natural variation.
@@ -57,7 +63,7 @@ def generate_fibonacci_sphere_rays(center, radius, n, jitter_scale=0.03):
         ray_dirs: Ray directions (normalized vectors pointing outward from center)
     """
     # Create indices tensor
-    indices = to.arange(0, n, dtype=to.float32)
+    indices = to.arange(0, n, dtype=to.float32, device=device)
 
     # Calculate z coordinates (vectorized)
     z = 1 - (2 * indices) / (n - 1) if n > 1 else to.zeros(1)
@@ -143,48 +149,124 @@ def compute_pairwise_euclidean(points):
     sq_dists = sum_sq + sum_sq.T - 2.0 * (points @ points.T)
     sq_dists = to.clamp(sq_dists, min=0.0)  # numerical stability
     return to.sqrt(sq_dists)
-import torch.nn.functional as F
 
 
-
-def based_v2_loss(points, predicted_depth_vals, ground_truth_depth_vals, lambda_laplacian=0.2):
+def based_v2_loss(
+    points, predicted_depth_vals, ground_truth_depth_vals, lambda_laplacian=0.2
+):
     """
     Computes the total loss as a combination of fidelity loss (e.g., MSE)
     and the Laplacian (smoothness) loss.
-    
+
     predicted_depth_vals: Predicted depth values, tensor of shape [N, 1] or [N]
     ground_truth_depth_vals: Ground truth depth values, tensor of shape [N] (or [N, 1])
     lambda_laplacian: Weighting factor for the Laplacian loss.
     """
     # Data fidelity loss: mean squared error between predicted and ground truth depth\
 
-
     # fidelity_loss = F.mse_loss(predicted_depth_vals.squeeze(), ground_truth_depth_vals)
     fidelity_loss = 0
     # Laplacian smoothness loss
     laplacian_loss = compute_graph_laplacian_loss(points, predicted_depth_vals)
-    
+
     # Total loss: combine both terms
     total_loss = fidelity_loss + lambda_laplacian * laplacian_loss
     return total_loss
 
 
-def compute_graph_laplacian_loss(points, depth_vals):
-    distances = to.cdist(points, points) 
-    get_top_16_distances, get_top_16_indices = distances.topk(16, 1, largest=False)  # Get top 16 neighbors
-    
-    # Compute weights inversely proportional to distance, and normalize (using L2 norm here)
-    weights = 1 / (get_top_16_distances + 1e-4)
-    weights = weights / to.norm(weights, dim=1, keepdim=True)
-    
-    # Compute the weighted average of neighbors' depth values
-    neighbour_average = to.sum(weights * depth_vals[get_top_16_indices], dim=1)
-    
-    # Laplacian loss: squared difference between each depth value and its neighbors' average
-    loss = to.sum((depth_vals - neighbour_average) ** 2)
-    return loss
+def compute_weighted_neighbors(ray_oris, depth_values, k=4):
+    """
+    Computes the weighted average of k-nearest neighbors for each point.
+    Returns the weighted neighbor positions.
+    """
 
-    
+    # Compute pairwise distances between points
+    distances = to.cdist(ray_oris, ray_oris)
+
+    # Exclude self from nearest neighbors
+    N = depth_values.shape[0]
+    diag_mask = to.eye(N, device=depth_values.device, dtype=distances.dtype)
+    distances = distances + diag_mask * 1e6
+
+    # Get k nearest neighbors
+    topk_distances, topk_indices = distances.topk(k=k, dim=1, largest=False)
+
+    # Compute Gaussian weights and normalize
+    weights = to.exp(-0.5 * topk_distances)
+    weights = weights / weights.sum(dim=1, keepdim=True)
+
+    # Gather neighbor positions: shape (N, k, D)
+    neighbor_positions = depth_values[topk_indices]
+
+    # Compute weighted average of neighbor positions for each point
+    weighted_neighbors = to.sum(
+        weights.unsqueeze(-1) * neighbor_positions, dim=1)
+
+    return (
+        weighted_neighbors,
+        topk_indices,
+        weights,
+    )  # Return weighted neighbors, indices and weights
+
+
+def implicit_backward_euler_laplacian_smooth(ray_oris, depth_value, step_size, k=4):
+    N, D = depth_value.shape
+    # Compute weighted neighbors (and get neighbor indices and weights)
+    weighted_neighbors, neighbor_indices, weights = compute_weighted_neighbors(
+        ray_oris, depth_value, k=k
+    )
+
+    # Build dense identity matrix
+    I = to.eye(N, device=depth_value.device, dtype=depth_value.dtype)
+
+    # Build dense weight matrix W of shape (N, N)
+    # Start with zeros and scatter the weight values into their corresponding columns.
+    W = to.zeros((N, N), device=depth_value.device, dtype=depth_value.dtype)
+    # neighbor_indices has shape (N, k) and weights has the same shape.
+    W.scatter_(1, neighbor_indices, weights)
+
+    # Construct A = (1 + step_size) * I - step_size * W
+    A = (1 + step_size) * I - step_size * W
+
+    # Right-hand side b is current_positions, solve A X = current_positions for X.
+    new_positions = to.linalg.solve(A, depth_value)
+    return new_positions
+
+
+def compute_graph_laplacian_loss(ray_oris, t_vals, k=16):
+    """
+    Compute the Laplacian differences for each point in the point cloud.
+    The Laplacian is defined as the difference between the point and the
+    weighted average of its k nearest neighbors (excluding itself).
+    """
+    # Compute pairwise distances between points
+    distances = to.cdist(ray_oris, ray_oris)
+
+    # Exclude self from nearest neighbors by setting diagonal to a large number
+    N = ray_oris.shape[0]
+    diag_mask = to.eye(N, device=ray_oris.device, dtype=distances.dtype)
+    # large value ensures self is not selected
+    distances = distances + diag_mask * 1e6
+
+    # Get k nearest neighbors (excluding the point itself)
+    topk_distances, topk_indices = distances.topk(k=k, dim=1, largest=False)
+
+    # Compute Gaussian weights and normalize
+    weights = to.exp(-0.5 * topk_distances)
+    weights = weights / weights.sum(dim=1, keepdim=True)
+
+    # Gather neighbor positions: shape (N, k, D)
+    neighbor_positions = t_vals[topk_indices]
+
+    # Compute weighted average of neighbor positions for each point
+    weighted_neighbors = to.sum(
+        weights.unsqueeze(-1) * neighbor_positions, dim=1)
+    laplacian_diff = t_vals - weighted_neighbors
+    l2_loss = to.sum(laplacian_diff**2)
+    return l2_loss
+
+
+"""
 def compute_weighted_neighbors(points):
     # Compute pairwise distances (assuming compute_pairwise_euclidean exists)
     distances = compute_pairwise_euclidean(points)  # shape: [N, N]
@@ -195,6 +277,8 @@ def compute_weighted_neighbors(points):
     # Normalize weights to sum to 1 for each point (L1 normalization)
     weights = weights / weights.sum(dim=1, keepdim=True)
     return get_top_16_indices, weights
+"""
+
 
 def build_operator_matrix(num_points, top_indices, weights, dt):
     """
@@ -203,13 +287,13 @@ def build_operator_matrix(num_points, top_indices, weights, dt):
     """
     # We'll collect row indices, col indices, and corresponding values
     rows, cols, vals = [], [], []
-    
+
     # Diagonal entries: for each point, we have A_ii = 1 + dt.
     for i in range(num_points):
         rows.append(i)
         cols.append(i)
         vals.append(1.0 + dt)
-    
+
     # Off-diagonals: for each point i and each neighbor j,
     # A_ij = -dt * weight_ij.
     for i in range(num_points):
@@ -218,18 +302,17 @@ def build_operator_matrix(num_points, top_indices, weights, dt):
             w_ij = weights[i, k].item()
             rows.append(i)
             cols.append(j)
-            vals.append(- dt * w_ij)
-    
+            vals.append(-dt * w_ij)
+
     # Build a sparse tensor A of shape [num_points, num_points]
     indices = to.tensor([rows, cols], dtype=to.long)
     values = to.tensor(vals, dtype=to.float32)
-    A_sparse = to.sparse_coo_tensor(indices, values=values, size=(num_points, num_points)) 
+    A_sparse = to.sparse_coo_tensor(
+        indices, values=values, size=(num_points, num_points)
+    )
 
     return A_sparse
 
-
-import scipy.sparse as sp
-import scipy.sparse.linalg as spla
 
 def backward_euler_update(points, depth_vals, dt):
     """
@@ -239,6 +322,7 @@ def backward_euler_update(points, depth_vals, dt):
     depth_vals: tensor of shape [N] or [N, 1]
     dt: time step (scalar)
     """
+
     # Ensure depth_vals is of shape [N]
     num_points = depth_vals.shape[0]
     depth_vals = depth_vals.reshape(-1)
@@ -247,31 +331,11 @@ def backward_euler_update(points, depth_vals, dt):
     top_indices, weights = compute_weighted_neighbors(points)
 
     # Build sparse system matrix A = I + dt * (I - W)
-    A_sparse = build_operator_matrix(num_points, top_indices, weights, dt).to(device=device)
-    # Use conjugate gradient method to solve the system Ax = b while preserving gradients
-    def mv(v):
-        """Matrix-vector product using sparse matrix"""
-        return to.sparse.mm(A_sparse, v.unsqueeze(1)).squeeze(1)
-    
-    # Initial guess and residual
-    x = to.zeros_like(depth_vals)
-    r = depth_vals - mv(x)
-    p = r.clone()
-    rsold = to.dot(r, r)
-    
-    # Conjugate gradient iterations
-    for i in range(min(100, num_points)):
-        Ap = mv(p)
-        alpha = rsold / (to.dot(p, Ap) + 1e-10)
-        x = x + alpha * p
-        r = r - alpha * Ap
-        rsnew = to.dot(r, r)
-        if to.sqrt(rsnew) < 1e-8:
-            break
-        p = r + (rsnew / (rsold + 1e-10)) * p
-        rsold = rsnew
-    
-    return x
+    A_sparse = build_operator_matrix(num_points, top_indices, weights, dt).to(
+        device=device
+    )
+    return to.linalg.solve(A_sparse.to_dense(), depth_vals)
+
 
 def quaternion_to_rotation_matrix(quaternions):
     x = quaternions[:, 1]
@@ -356,14 +420,18 @@ class GaussianModel:
         self.normals[flip_mask] = -self.normals[flip_mask]
         self.reference_normals = self.normals
 
+
 def evaluate_points(points, gaussian_means, gaussian_inv_covs, gaussian_opacities):
     distance_to_mean = points - gaussian_means
     exponent = -0.5 * (
-        distance_to_mean[:, :, None, :] @ gaussian_inv_covs @ distance_to_mean[..., None]
+        distance_to_mean[:, :, None, :]
+        @ gaussian_inv_covs
+        @ distance_to_mean[..., None]
     ).squeeze(-1)
     exponent = to.clamp(exponent, min=-50, max=50)
     evaluations = gaussian_opacities * to.exp(exponent)
     return evaluations
+
 
 def evaluate_points_2(points, gaussian_means, gaussian_inv_covs, gaussian_opacities):
     distance_to_mean = points - gaussian_means
@@ -375,6 +443,7 @@ def evaluate_points_2(points, gaussian_means, gaussian_inv_covs, gaussian_opacit
     evaluations = gaussian_opacities * to.exp(exponent).squeeze(-1)
     return evaluations
 
+
 def skew_symmetric(v):
     """
     v: shape (..., 3)
@@ -385,12 +454,16 @@ def skew_symmetric(v):
     #      [ vz,  0, -vx],
     #      [-vy, vx,   0]]
     zero = to.zeros_like(v[..., 0])
-    K = to.stack([
-        to.stack([zero,         -v[..., 2],  v[..., 1]], dim=-1),
-        to.stack([v[..., 2],    zero,       -v[..., 0]], dim=-1),
-        to.stack([-v[..., 1],   v[..., 0],   zero      ], dim=-1),
-    ], dim=-2)
+    K = to.stack(
+        [
+            to.stack([zero, -v[..., 2], v[..., 1]], dim=-1),
+            to.stack([v[..., 2], zero, -v[..., 0]], dim=-1),
+            to.stack([-v[..., 1], v[..., 0], zero], dim=-1),
+        ],
+        dim=-2,
+    )
     return K
+
 
 def normals_to_rot_matrix_2(a, b):
     # a and b are assumed to be unit vectors (with shape [..., 3])
@@ -468,7 +541,7 @@ def quaternion_multiply(q, r):
 def normals_to_rot_matrix(a, b):
     """
     a, b: shape (R, N, 3) or (N, 3) or (any_batch, 3)
-        Each [i,j,:] is a normal vector. 
+        Each [i,j,:] is a normal vector.
     Returns: shape (R, N, 3, 3) or matching batch shape + (3,3).
             Rotation matrices that rotate each a[i,j] onto b[i,j].
     """
@@ -503,11 +576,13 @@ def normals_to_rot_matrix(a, b):
     # But if a ≈ -b, you get 180° rotation; handle that if needed.
 
     return R
-def get_max_responses_and_tvals(ray_oris, means, covs, ray_dirs, opacities, normals, old_normals):
-    new_rotations = normals_to_rot_matrix(old_normals, normals)
-    new_covs = new_rotations @ covs @ new_rotations.transpose(-2, -1)
-    covs_reg = covs + to.eye(3, device=covs.device).unsqueeze(0).unsqueeze(0) * 1e-3
 
+
+def get_max_responses_and_tvals(
+    ray_oris, means, covs, ray_dirs, opacities, normals, old_normals
+):
+    new_rotations = normals_to_rot_matrix(old_normals, normals)
+    new_covs = new_rotations.transpose(-2, -1) @ covs @ new_rotations
     inv_covs = to.linalg.inv(new_covs)
     rg_diff = means - ray_oris
     inv_cov_d = inv_covs @ ray_dirs[..., None]
@@ -521,12 +596,15 @@ def get_max_responses_and_tvals(ray_oris, means, covs, ray_dirs, opacities, norm
 
     return max_responses, t_values
 
+
 def get_max_responses_and_tvals_2(
     ray_oris, means, covs, ray_dirs, opacities, normals, old_normals
 ):
     new_rotations = normals_to_rot_matrix(old_normals, normals)
     new_covs = new_rotations @ covs @ new_rotations.transpose(-2, -1)
-    covs_reg = covs + to.eye(3, device=covs.device).unsqueeze(0).unsqueeze(0) * 1e-3  # Increase regularization
+    covs_reg = (
+        covs + to.eye(3, device=covs.device).unsqueeze(0).unsqueeze(0) * 1e-3
+    )  # Increase regularization
 
     inv_covs = to.linalg.inv(new_covs)
     rg_diff = means - ray_oris
@@ -548,17 +626,27 @@ class GaussianParameters(nn.Module):
         self.gaussian_model = GaussianModel(path)
         self.means = nn.Parameter(self.gaussian_model.means)
         self.normals = nn.Parameter(self.gaussian_model.normals)
-        self.ray_oris, self.ray_dirs = generate_rays_from_points(self.means, 2.0)
+
     def based_2(self):
-        depth_values = self.project_2().squeeze() 
-        predicted_depth_values = backward_euler_update(self.ray_oris, depth_values, 0.1)  
-        fidelity_loss = 0
-        lambda_laplacian = 5
+        depth_values = self.project_2().squeeze()
+        predicted_depth_values = backward_euler_update(
+            self.ray_oris, depth_values, 0.1)
+        fidelity_loss = F.mse_loss(
+            predicted_depth_values.squeeze(), depth_values)
+        lambda_laplacian = 0.3
         # Laplacian smoothness loss
-        laplacian_loss = compute_graph_laplacian_loss(self.ray_oris, predicted_depth_values)
-        
-        # Total loss: combine both terms
-        return laplacian_loss
+        laplacian_loss = compute_graph_laplacian_loss(self.ray_oris)
+
+        print("Laplacian loss", lambda_laplacian * laplacian_loss)
+        print("Fidelity loss", (1 - lambda_laplacian) * fidelity_loss)
+        total_loss = (
+            lambda_laplacian * laplacian_loss +
+            (1 - lambda_laplacian) * fidelity_loss
+        )
+        return (
+            lambda_laplacian * laplacian_loss +
+            (1 - lambda_laplacian) * fidelity_loss
+        )
 
     def forward(self):
         return self.means, self.normals
@@ -595,7 +683,9 @@ class GaussianParameters(nn.Module):
             rotation_expanded @ scaled_vertices[..., None]
         )  # [N, 2, 3, 1]
 
-        new_rotations = normals_to_rot_matrix(self.gaussian_model.reference_normals[None, ...], self.normals[None, ...])
+        new_rotations = normals_to_rot_matrix(
+            self.gaussian_model.reference_normals[None, ...], self.normals[None, ...]
+        )
         new_rots = new_rotations.squeeze(0).unsqueeze(1)
         rotated_vertices = new_rots @ rotated_vertices
         rotated_vertices = rotated_vertices.squeeze(-1)  # [N, 2, 3]
@@ -761,8 +851,9 @@ class GaussianParameters(nn.Module):
         )
 
         context.canvas.update()
-        return context      
-    def project(self, batch_size=2048, temperature=0.01, use_soft_indices=False):
+        return context
+
+    def project(self, batch_size=2048, temperature=0.01, use_soft_indices=True):
         num_rays = self.ray_oris.shape[0]
         num_batches = (num_rays + batch_size - 1) // batch_size
         all_blended_tvals = []
@@ -778,24 +869,36 @@ class GaussianParameters(nn.Module):
             if use_soft_indices:
                 # Get soft t-values and weights for all gaussians
                 soft_tvals, soft_weights = get_soft_top_candidates(
-                    ray_oris_batch, ray_dirs_batch, min_corners, max_corners, temperature=temperature
+                    ray_oris_batch,
+                    ray_dirs_batch,
+                    min_corners,
+                    max_corners,
+                    temperature=temperature,
                 )
-                
+
                 # Calculate responses and t-values for all gaussians
                 # (reshape ray origins and directions for broadcasting)
                 responses, tvals = get_max_responses_and_tvals(
                     ray_oris_batch[:, None, :],
-                    self.means.unsqueeze(0).expand(ray_oris_batch.shape[0], -1, 3),
-                    self.gaussian_model.covariances.unsqueeze(0).expand(ray_oris_batch.shape[0], -1, 3, 3),
+                    self.means.unsqueeze(0).expand(
+                        ray_oris_batch.shape[0], -1, 3),
+                    self.gaussian_model.covariances.unsqueeze(0).expand(
+                        ray_oris_batch.shape[0], -1, 3, 3
+                    ),
                     ray_dirs_batch[:, None, :],
-                    self.gaussian_model.opacities.unsqueeze(0).expand(ray_oris_batch.shape[0], -1, 1),
-                    self.normals.unsqueeze(0).expand(ray_oris_batch.shape[0], -1, 3),
-                    self.gaussian_model.normals.unsqueeze(0).expand(ray_oris_batch.shape[0], -1, 3),
+                    self.gaussian_model.opacities.unsqueeze(0).expand(
+                        ray_oris_batch.shape[0], -1, 1
+                    ),
+                    self.normals.unsqueeze(0).expand(
+                        ray_oris_batch.shape[0], -1, 3),
+                    self.gaussian_model.normals.unsqueeze(0).expand(
+                        ray_oris_batch.shape[0], -1, 3
+                    ),
                 )
-                
+
                 # Apply soft weights to responses
                 responses = responses * soft_weights
-                
+
                 # Continue with the same alpha composition as the hard approach
                 _, sorted_idx = to.sort(tvals, dim=1)
                 sorted_alphas = responses.gather(dim=1, index=sorted_idx)
@@ -805,13 +908,16 @@ class GaussianParameters(nn.Module):
                 shifted[:, 1:] = transmittance[:, :-1]
                 sorted_contribution = shifted - transmittance
                 norm_factor = to.sum(sorted_contribution, dim=1, keepdim=True)
-                sorted_contribution = sorted_contribution / (norm_factor + 1e-8)
+                sorted_contribution = sorted_contribution / \
+                    (norm_factor + 1e-8)
                 inv_idx = sorted_idx.argsort(dim=1)
                 contribution = sorted_contribution.gather(dim=1, index=inv_idx)
                 batch_blended_tvals = to.sum(contribution * tvals, dim=1)
             else:
                 # Existing hard selection method:
-                ray_gaussian_candidates = self.get_top_16_differentiable_batch(ray_oris_batch, ray_dirs_batch).long()
+                ray_gaussian_candidates = self.get_top_16_differentiable_batch(
+                    ray_oris_batch, ray_dirs_batch
+                ).long()
                 responses, tvals = get_max_responses_and_tvals(
                     ray_oris_batch[:, None, :],
                     self.means[ray_gaussian_candidates],
@@ -829,7 +935,8 @@ class GaussianParameters(nn.Module):
                 shifted[:, 1:] = transmittance[:, :-1]
                 sorted_contribution = shifted - transmittance
                 norm_factor = to.sum(sorted_contribution, dim=1, keepdim=True)
-                sorted_contribution = sorted_contribution / (norm_factor + 1e-8)
+                sorted_contribution = sorted_contribution / \
+                    (norm_factor + 1e-8)
                 inv_idx = sorted_idx.argsort(dim=1)
                 contribution = sorted_contribution.gather(dim=1, index=inv_idx)
                 batch_blended_tvals = to.sum(contribution * tvals, dim=1)
@@ -838,7 +945,8 @@ class GaussianParameters(nn.Module):
 
         return to.cat(all_blended_tvals, dim=0)[..., None]
 
-    def project_2(self,batch_size=2048):
+    def project_2(self, batch_size=2048):
+        #       self.ray_oris, self.ray_dirs = generate_rays_from_points(self.means, 2)
 
         num_rays = self.ray_oris.shape[0]
         num_batches = (num_rays + batch_size - 1) // batch_size
@@ -849,13 +957,14 @@ class GaussianParameters(nn.Module):
             # Get batch indices
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, num_rays)
-            
+
             # Get ray data for this batch
             ray_oris_batch = self.ray_oris[start_idx:end_idx]
             ray_dirs_batch = self.ray_dirs[start_idx:end_idx]
 
-
-            ray_gaussian_indices = self.get_top_16_differentiable_batch(ray_oris_batch, ray_dirs_batch)
+            ray_gaussian_indices = self.get_top_16_differentiable_batch(
+                ray_oris_batch, ray_dirs_batch
+            )
 
             # Calculate responses and t-values
             responses, tvals = get_max_responses_and_tvals(
@@ -867,95 +976,95 @@ class GaussianParameters(nn.Module):
                 self.normals[ray_gaussian_indices],
                 self.gaussian_model.normals[ray_gaussian_indices],
             )
-            
+
             # Sort by t-values
             _, sorted_idx = to.sort(tvals, dim=1)
             sorted_alphas = responses.gather(dim=1, index=sorted_idx)
-            
+
             # Calculate transmittance
             alphas_compliment = 1 - sorted_alphas
             transmittance = to.cumprod(alphas_compliment, dim=1)
-            
+
             # Calculate contributions
             shifted = to.ones_like(transmittance)
             shifted[:, 1:] = transmittance[:, :-1]
             sorted_contribution = shifted - transmittance
-            
+
             # Normalize contributions
             norm_factor = to.sum(sorted_contribution, dim=1, keepdim=True)
             # Add small epsilon to avoid division by zero
             sorted_contribution = sorted_contribution / (norm_factor + 1e-8)
-            
+
             # Unsort the contribution
             inv_idx = sorted_idx.argsort(dim=1)
             contribution = sorted_contribution.gather(dim=1, index=inv_idx)
-            
+
             # Calculate blended t-values
             batch_blended_tvals = to.sum(contribution * tvals, dim=1)
             all_blended_tvals.append(batch_blended_tvals)
-        
-        
-        # Concatenate results from all batches
-        return to.cat(all_blended_tvals , dim=0)
+
+        return to.cat(all_blended_tvals, dim=0)
+
     def get_top_16_differentiable_batch(self, ray_oris, ray_dirs):
         """
         Batched version of get_top_16_differentiable.
-        
+
         Args:
             ray_oris: Ray origins tensor of shape [batch_size, 3]
             ray_dirs: Ray directions tensor of shape [batch_size, 3]
-            
+
         Returns:
             torch.Tensor: Indices of top 16 closest boxes for each ray
         """
         # Get bounding box corners
         min_corners, max_corners = self.create_bounding_boxes()
-        
+
         # Get dimensions
         num_rays = ray_oris.shape[0]
         num_boxes = min_corners.shape[0]
-        
+
         # Expand dimensions for broadcasting
         ray_oris_exp = ray_oris.unsqueeze(1)  # [R, 1, 3]
         ray_dirs_exp = ray_dirs.unsqueeze(1)  # [R, 1, 3]
         min_corners_exp = min_corners.unsqueeze(0)  # [1, B, 3]
         max_corners_exp = max_corners.unsqueeze(0)  # [1, B, 3]
-        
+
         # Compute safe reciprocal of ray directions
         safe_ray_dirs = to.where(
             ray_dirs_exp != 0, ray_dirs_exp, to.full_like(ray_dirs_exp, 1e-8)
         )
         inv_dirs = 1.0 / safe_ray_dirs  # [R, 1, 3]
-        
+
         # Compute intersection t-values
         t1 = (min_corners_exp - ray_oris_exp) * inv_dirs
         t2 = (max_corners_exp - ray_oris_exp) * inv_dirs
-        
+
         t_min = to.minimum(t1, t2)
         t_max = to.maximum(t1, t2)
-        
+
         t_entry = to.max(t_min, dim=2)[0]
         t_exit = to.min(t_max, dim=2)[0]
-        
+
         hit = (t_exit > t_entry) & (t_exit > 0)
         t_hit = to.where(t_entry > 0, t_entry, t_exit)
         t_hit = to.where(hit, t_hit, to.full_like(t_hit, float("inf")))
-        
+
         # Get top 16 closest hit boxes
         k = min(16, num_boxes)
         top_values, top_indices = to.topk(t_hit, k=k, dim=1, largest=False)
-        
+
         # Pad with -1 if needed
         if k < 16:
             padding = to.full(
-                (num_rays, 16 - k), 
+                (num_rays, 16 - k),
                 -1,
-                device=top_indices.device, 
-                dtype=top_indices.dtype
+                device=top_indices.device,
+                dtype=top_indices.dtype,
             )
             top_indices = to.cat([top_indices, padding], dim=1)
-        
+
         return top_indices
+
     def get_top_16_differentiable(self):
         """
         Differentiable PyTorch implementation of ray-box intersection that returns
@@ -1022,7 +1131,7 @@ class GaussianParameters(nn.Module):
             top_indices = to.cat([top_indices, padding], dim=1)
 
         return top_indices
-        
+
     def implicit_depth_update(self, d_current, delta_t):
         # Solve the linear system (I + delta_t * laplacian) * d_new = d_current
         I = to.eye(self.laplacian.shape[0], device=self.laplacian.device)
@@ -1031,29 +1140,33 @@ class GaussianParameters(nn.Module):
         return d_new
 
     def based_loss(self):
-        ray_oris, ray_dirs = generate_rays_from_points(self.gaussian_model.means, 2)
+        ray_oris, ray_dirs = generate_rays_from_points(
+            self.gaussian_model.means, 2)
         self.ray_oris = ray_oris.to(device)
         self.ray_dirs = ray_dirs.to(device)
         self.num_rays = ray_oris.shape[0]
         return compute_graph_laplacian_loss(ray_oris, self.project_2())
-        
 
     def harmonic_loss(self):
-        ray_oris, ray_dirs = generate_rays_from_points(self.gaussian_model.means, 2)
+        ray_oris, ray_dirs = generate_rays_from_points(
+            self.gaussian_model.means, 2)
         model.ray_oris = ray_oris.to(device)
         model.ray_dirs = ray_dirs.to(device)
         model.num_rays = ray_oris.shape[0]
-        model.laplacian = compute_graph_laplacian_loss(ray_oris, model.project_2()).to(device)
+        model.laplacian = compute_graph_laplacian_loss(ray_oris, model.project_2()).to(
+            device
+        )
         # Compute the main loss via the Laplacian quadratic form on the projected t-values.
-        delta_t = 1.0                    
-        d_current = self.project_2()    
+        delta_t = 1.0
+        d_current = self.project_2()
         d_new = self.implicit_depth_update(d_current, delta_t)
         feature_loss = to.sum((d_new - d_current) ** 2)
         return feature_loss
+
     def harmonic_loss_2(self):
         # Compute the current projection of t-values.
         blended_t_vals = self.project()
-    
+
         if to.isnan(blended_t_vals).any() or to.isinf(blended_t_vals).any():
             raise ValueError("NaN or Inf detected in blended_t_vals")
 
@@ -1149,7 +1262,7 @@ def matrix_to_quaternion(rotation_matrices):
     cond1 = trace > 0
     cond2 = (rotation_matrices[:, 0, 0] > rotation_matrices[:, 1, 1]) & ~cond1
     cond3 = (rotation_matrices[:, 1, 1] >
-            rotation_matrices[:, 2, 2]) & ~(cond1 | cond2)
+             rotation_matrices[:, 2, 2]) & ~(cond1 | cond2)
     cond4 = ~(cond1 | cond2 | cond3)
 
     S = to.zeros_like(trace)
@@ -1330,82 +1443,124 @@ def save_optimized_gaussian_model(model, output_path="optimized_point_cloud.ply"
     PlyData([ply_element], text=False).write(output_path)
 
 
-def visualize_depth_updates(model, update_interval=0.1):
+def visualize_depth_updates(model, ray_oris, ray_dirs, update_interval=0.1):
     """
-    Visualize the current depth values by plotting the points
-    computed as: ray_ori + (depth * ray_dir)
-    using Vispy. This function updates every 'update_interval'
-    seconds.
+    Creates a Vispy window which displays updated ray positions.
+    Each frame, the ray positions are computed as:
+        new_points = ray_oris + (projected_depth * ray_dirs)
+    and the points are colored based on their current depth value.
+    """
+    canvas = scene.SceneCanvas(keys="interactive", bgcolor="black", show=True)
+    view = canvas.central_widget.add_view()
+    view.camera = scene.cameras.TurntableCamera()
+
+    # Create markers which will be updated each tick.
+    scatter = scene.visuals.Markers(parent=view.scene)
+
+    def update(event):
+        depth = model.project_2().squeeze().detach().cpu().numpy()  # (N,1) or (N,)
+        depth = depth[..., None]
+
+        # Compute updated positions.
+        new_points = ray_oris.detach().cpu().numpy()
+        # Normalize depth values for color mapping.
+        min_d = np.min(depth)
+        max_d = np.max(depth)
+        norm_depth = (depth - min_d) / (max_d - min_d + 1e-8)
+
+        # Create a blue-to-red colormap: red increases with depth, blue decreases.
+        colors = np.zeros((new_points.shape[0], 4), dtype=np.float32)
+        colors[:, 0] = norm_depth[:, 0]  # Red channel
+        colors[:, 1] = 0.2  # Fixed green channel
+        colors[:, 2] = 1 - norm_depth[:, 0]  # Blue channel
+        colors[:, 3] = 1.0  # Alpha
+
+        # Update markers.
+        scatter.set_data(new_points, face_color=colors, size=10)
+        canvas.update()
+
+    # Start timer to update every 'update_interval' seconds.
+    timer = app.Timer(interval=100)
+    timer.connect(update)
+    timer.start()
+    app.run()
+
+
+def start_visualization(model, ray_oris, ray_dirs, update_interval=0.2):
+    visualize_depth_updates(model, ray_oris, ray_dirs,
+                            update_interval=update_interval)
+
+
+def visualize_means_evolution(model, update_interval=0.2):
+    """
+    Visualize the evolution of gaussian means over time.
+    A Vispy scatter plot is periodically updated with the current values of `model.means`.
+
+    Args:
+        model: Your GaussianParameters model.
+        update_interval: Time between updates in seconds.
     """
     from vispy import scene, app
     import numpy as np
 
-    # Set up the canvas and view.
-    canvas = scene.SceneCanvas(keys="interactive", bgcolor="black")
+    # Set up the Vispy canvas and view.
+    canvas = scene.SceneCanvas(keys="interactive", bgcolor="black", show=True)
     view = canvas.central_widget.add_view()
-    view.camera = scene.cameras.TurntableCamera()
-
-    # Create markers visuals once, outside the update function
+    view.camera = scene.cameras.TurntableCamera(fov=45)
+    # Initialize scatter visual for gaussian means.
     scatter = scene.visuals.Markers(parent=view.scene)
-    scatter_means = scene.visuals.Markers(parent=view.scene)
 
-    # Initialize with the ray origins
-    initial_points = (
-        model.ray_oris.detach().cpu().numpy()
-        + model.project_2().detach().cpu().numpy() * model.ray_dirs.detach().cpu().numpy()
-    )
-
-    scatter.set_data(initial_points, face_color="red", size=10)
-    
-    # Initialize means visualization
-    means = model.means.detach().cpu().numpy()
-    scatter_means.set_data(means, face_color="blue", size=10)
-
-    # Update function called every timer tick
+    # Update function: update scatter data with current means.
     def update(event):
-        # Compute new positions as: ray_ori + (depth * ray_dir)
-        new_points = (
-            model.ray_oris.detach().cpu().numpy()
-            + model.project_2().detach().cpu().numpy()
-            * model.ray_dirs.detach().cpu().numpy()
-        )
-        
-        # Update existing scatter visuals instead of creating new ones
-        scatter.set_data(new_points, face_color="red", size=10)
-        
-        # Update means visualization
-        means = model.means.detach().cpu().numpy()
-        scatter_means.set_data(means, face_color="blue", size=10)
-        
+        # Get current means (detach from graph to prevent interference with training)
+        means_np = model.means.detach().cpu().numpy()
+        # Update scatter: here we use red color; adjust size/color as needed.
+        scatter.set_data(means_np, face_color=(1, 0, 0, 1), size=10)
         canvas.update()
 
-    # Set up a timer to update the visualization periodically.
+    # Set up timer to trigger update periodically.
     timer = app.Timer(interval=update_interval, connect=update, start=True)
-    
     view.camera.set_range()
-    canvas.show()
     app.run()
 
 
-def start_visualization(model, update_interval=0.2      ):
-    visualize_depth_updates(model, update_interval=update_interval)
+def train_model(model, num_iterations=200, lr=0.00003):
+    optimizer = to.optim.AdamW(model.parameters(), lr=lr, amsgrad=True)
 
+    # Start visualization in a separate thread - this could be interfering with the training
+    '''
+    thread = threading.Thread(
+        target=start_visualization, args=(model, ray_oris, ray_dirs, 0.2)
+    )
+    thread.daemon = True  # Make the thread daemon so it exits when main program does
+    losses = []
+    '''
+    n_of_rays = 7000
+    radius = 2
 
-def train_model(model, num_iterations=200, lr=0.001):
+    sphere_centre = to.tensor([
+        to.mean(model.means[0]),
+        to.mean(model.means[1]),
+        to.mean(model.means[2])
+    ], device=device)
+
+    sphere_params = (sphere_centre, radius, n_of_rays)
     
-    optimizer = to.optim.Adamax(model.parameters(), lr=lr)
-    for iteration in tqdm(range(num_iterations)):
-        optimizer.zero_grad()        
-
-        loss = model.based_2()
-    
-        loss.backward(retain_graph=True)
-
+    previous_means = model.means.clone().detach()
+    for iteration in tqdm(range(num_iterations - 1)):
+        model.ray_oris, model.ray_dirs = generate_fibonacci_sphere_rays(*sphere_params)
+        optimizer.zero_grad()
+        # Fix ray origins/directions once at the beginning
+        features = model.project_2()
+        lap_loss = features.T @ get_laplacian(model.ray_oris)  @ features
+        mean_loss = to.sum((model.means - previous_means) ** 2)
+        previous_means = model.means.clone().detach()
+        loss = lap_loss + mean_loss
+        loss.backward()
         optimizer.step()
-    
 
     save_optimized_gaussian_model(
-        model, output_path="optimized_point_cloud.ply") 
+        model, output_path="out.ply")
 
 def get_box_corners(mins, maxs):
     """
@@ -1415,37 +1570,43 @@ def get_box_corners(mins, maxs):
         mins: (B, 3) tensor/array for minimum corner of the box.
         maxs: (B, 3) tensor/array for maximum corner of the box.
 
+
     Returns:
         (B, 8, 3) tensor/array with the 8 corners of the box.
     """
     B = mins.shape[0]
     device = mins.device
-    
+
     # Create binary pattern for all 8 corners (use min or max for each dimension)
     # Format: [x, y, z] where 0=min, 1=max
-    corner_pattern = to.tensor([
-        [0, 0, 0],  # min, min, min
-        [1, 0, 0],  # max, min, min
-        [1, 1, 0],  # max, max, min
-        [0, 1, 0],  # min, max, min
-        [0, 0, 1],  # min, min, max
-        [1, 0, 1],  # max, min, max
-        [1, 1, 1],  # max, max, max
-        [0, 1, 1],  # min, max, max
-    ], device=device).float()
-    
+    corner_pattern = to.tensor(
+        [
+            [0, 0, 0],  # min, min, min
+            [1, 0, 0],  # max, min, min
+            [1, 1, 0],  # max, max, min
+            [0, 1, 0],  # min, max, min
+            [0, 0, 1],  # min, min, max
+            [1, 0, 1],  # max, min, max
+            [1, 1, 1],  # max, max, max
+            [0, 1, 1],  # min, max, max
+        ],
+        device=device,
+    ).float()
+
     # Expand dimensions for broadcasting: (1, 8, 3)
     pattern = corner_pattern.unsqueeze(0)
-    
+
     # Expand mins and maxs for broadcasting: (B, 1, 3)
     mins_exp = mins.unsqueeze(1)
     maxs_exp = maxs.unsqueeze(1)
-    
+
     # Use pattern to select between min and max for each corner
     # (B, 8, 3) = (B, 1, 3) * (1, 8, 3) + (B, 1, 3) * (1 - (1, 8, 3))
     corners = maxs_exp * pattern + mins_exp * (1 - pattern)
-    
+
     return corners
+
+
 def test_scenario(old_mins, old_maxs, old_normals, new_normals):
     # Get all 8 corners of the bounding boxes.
     old_corners = get_box_corners(old_mins, old_maxs)
@@ -1460,17 +1621,18 @@ def test_scenario(old_mins, old_maxs, old_normals, new_normals):
 
     # Select a single box for visualization.
     box_idx = to.argmax(old_maxs - old_mins)
-    render_bounding_boxes(old_corners[box_idx:box_idx + 1],
-                        new_corners[box_idx:box_idx + 1],
-                        old_normals[box_idx:box_idx + 1],
-                        new_normals[box_idx:box_idx + 1])
-    raise Exception
+    render_bounding_boxes(
+        old_corners[box_idx: box_idx + 1],
+        new_corners[box_idx: box_idx + 1],
+        old_normals[box_idx: box_idx + 1],
+        new_normals[box_idx: box_idx + 1],
+    )
 
 
 def render_bounding_boxes(old_corners, new_corners, old_normals, new_normals):
     """
     Render bounding boxes and their normal vectors in 3D.
-    
+
     Args:
         old_corners: (B, 8, 3) tensor with corners of old bounding boxes
         new_corners: (B, 8, 3) tensor with corners of new bounding boxes
@@ -1479,7 +1641,7 @@ def render_bounding_boxes(old_corners, new_corners, old_normals, new_normals):
     """
     from vispy import scene, app
     import numpy as np
-    
+
     # Convert to NumPy arrays if tensors
     if isinstance(old_corners, to.Tensor):
         old_corners = old_corners.detach().cpu().numpy()
@@ -1489,23 +1651,34 @@ def render_bounding_boxes(old_corners, new_corners, old_normals, new_normals):
         old_normals = old_normals.detach().cpu().numpy()
     if isinstance(new_normals, to.Tensor):
         new_normals = new_normals.detach().cpu().numpy()
-    
+
     # Create scene
-    canvas = scene.SceneCanvas(keys='interactive', show=True, bgcolor='black')
+    canvas = scene.SceneCanvas(keys="interactive", show=True, bgcolor="black")
     view = canvas.central_widget.add_view()
     view.camera = scene.cameras.TurntableCamera(center=(0, 0, 0), fov=40)
-    
+
     # Calculate box centers
     old_centers = old_corners.mean(axis=1)  # (B, 3)
     new_centers = new_corners.mean(axis=1)  # (B, 3)
-    
+
     # Define box wireframe connections (edges between vertices)
-    box_connections = np.array([
-        [0, 1], [1, 5], [5, 4], [4, 0],  # bottom face
-        [0, 3], [3, 2], [2, 1], [2, 6], [6, 5],  # sides
-        [7, 6], [7, 3], [7, 4]  # remaining edges
-    ])
-    
+    box_connections = np.array(
+        [
+            [0, 1],
+            [1, 5],
+            [5, 4],
+            [4, 0],  # bottom face
+            [0, 3],
+            [3, 2],
+            [2, 1],
+            [2, 6],
+            [6, 5],  # sides
+            [7, 6],
+            [7, 3],
+            [7, 4],  # remaining edges
+        ]
+    )
+
     # Loop through boxes (usually just one box in this case)
     for i in range(old_corners.shape[0]):
         # Create old box wireframe (blue)
@@ -1514,56 +1687,62 @@ def render_bounding_boxes(old_corners, new_corners, old_normals, new_normals):
             connect=box_connections,
             color=(0, 0, 1, 1),  # blue
             width=2,
-            parent=view.scene
+            parent=view.scene,
         )
-        
+
         # Create new box wireframe (pink)
         new_box = scene.visuals.Line(
             pos=new_corners[i],
             connect=box_connections,
             color=(1, 0.5, 0.8, 1),  # pink
             width=2,
-            parent=view.scene
+            parent=view.scene,
         )
-        
+
         # Scale factor for normal vectors (make them visible enough)
         scale = 1.0
-        
+
         # Create old normal vector (red)
         old_normal_end = old_centers[i] + old_normals[i] * scale
         old_normal_line = scene.visuals.Line(
             pos=np.array([old_centers[i], old_normal_end]),
             color=(1, 0, 0, 1),  # red
             width=3,
-            parent=view.scene
+            parent=view.scene,
         )
-        
+
         # Create new normal vector (green)
         new_normal_end = new_centers[i] + new_normals[i] * scale
         new_normal_line = scene.visuals.Line(
             pos=np.array([new_centers[i], new_normal_end]),
             color=(0, 1, 0, 1),  # green
             width=3,
-            parent=view.scene
+            parent=view.scene,
         )
-    
+
     view.camera.set_range()
     view.camera.center = old_corners.mean(axis=1).mean(axis=0)
     app.run()
 
-def get_soft_top_candidates(ray_oris, ray_dirs, min_corners, max_corners, temperature=0.1):  # Increased temperature
+
+def get_soft_top_candidates(
+    ray_oris, ray_dirs, min_corners, max_corners, temperature=0.1
+):  # Increased temperature
     # Expand dimensions for broadcasting as in your hard selection method.
-    ray_oris_exp = ray_oris.unsqueeze(1)   # [R, 1, 3]
-    ray_dirs_exp = ray_dirs.unsqueeze(1)     # [R, 1, 3]
+    ray_oris_exp = ray_oris.unsqueeze(1)  # [R, 1, 3]
+    ray_dirs_exp = ray_dirs.unsqueeze(1)  # [R, 1, 3]
     min_corners_exp = min_corners.unsqueeze(0)  # [1, B, 3]
     max_corners_exp = max_corners.unsqueeze(0)  # [1, B, 3]
 
     # Check if any boxes are invalid (min > max)
     invalid_boxes = (min_corners > max_corners).any(dim=1)
     if invalid_boxes.any():
-        print(f"Warning: {invalid_boxes.sum().item()} invalid bounding boxes detected!")
-    
-    safe_ray_dirs = to.where(ray_dirs_exp != 0, ray_dirs_exp, to.full_like(ray_dirs_exp, 1e-8))
+        print(
+            f"Warning: {invalid_boxes.sum().item()} invalid bounding boxes detected!")
+
+    safe_ray_dirs = to.where(
+        ray_dirs_exp != 0, ray_dirs_exp, to.full_like(ray_dirs_exp, 1e-8)
+    )
     inv_dirs = 1.0 / safe_ray_dirs
 
     t1 = (min_corners_exp - ray_oris_exp) * inv_dirs
@@ -1577,29 +1756,35 @@ def get_soft_top_candidates(ray_oris, ray_dirs, min_corners, max_corners, temper
 
     # Determine hit condition and select t_hit
     hit = (t_exit > t_entry) & (t_exit > 0)
-    t_hit = to.where(t_entry > 0, t_entry, t_exit) 
-    
+    t_hit = to.where(t_entry > 0, t_entry, t_exit)
+
     # Count the hits to see if there's a problem
     total_hits = hit.sum().item()
     if total_hits == 0:
         print("Warning: No ray-box intersections found!")
         # Return default values instead of NaNs
-        return to.ones(ray_oris.shape[0], device=ray_oris.device), to.zeros((ray_oris.shape[0], min_corners.shape[0]), device=ray_oris.device)
-    
+        return to.ones(ray_oris.shape[0], device=ray_oris.device), to.zeros(
+            (ray_oris.shape[0], min_corners.shape[0]), device=ray_oris.device
+        )
+
     # Replace inf values with a large but finite number
     max_valid = t_hit[hit].max().item() if hit.any() else 1000.0
     t_hit = to.where(hit, t_hit, to.full_like(t_hit, max_valid * 10))
-    
+
     # Scale t_hit to avoid extremely large values in softmax
     t_scaled = t_hit / max(1.0, t_hit.abs().max().item())
-    
+
     # Apply a softmax with more stable temperature
     weights = to.softmax(-t_scaled / temperature, dim=1)
-    
+
     # Compute a weighted t-value for each ray, avoiding inf*0 which causes NaNs
-    soft_tvals = to.sum(weights * to.where(to.isinf(t_hit), to.zeros_like(t_hit), t_hit), dim=1)
-    
+    soft_tvals = to.sum(
+        weights * to.where(to.isinf(t_hit), to.zeros_like(t_hit), t_hit), dim=1
+    )
+
     return soft_tvals, weights
+
+
 def rotation_matrix_from_vectors(a, b, eps=1e-8):
     """
     Compute the rotation matrix that maps vector a to vector b using Rodrigues' formula.
@@ -1628,6 +1813,7 @@ def rotation_matrix_from_vectors(a, b, eps=1e-8):
     R = to.eye(3, device=a.device) + vx + (vx @ vx) * ((1 - c) / (s**2))
     return R
 
+
 def batched_rotation_matrices(A, B, eps=1e-8):
     # A, B have shape (R, N, 3)
     R_mats = []
@@ -1639,15 +1825,17 @@ def batched_rotation_matrices(A, B, eps=1e-8):
             mats.append(mat[None, ...])  # shape: (1, 3, 3)
         R_mats.append(to.cat(mats, dim=0)[None, ...])
     return to.cat(R_mats, dim=0)  # shape: (R, N, 3, 3)
+
+
 def create_complete_rotation(v_original, v_target):
     # Normalize inputs
     v_original = v_original / to.norm(v_original)
     v_target = v_target / to.norm(v_target)
-    
+
     # First, find the rotation axis and angle
     rotation_axis = to.cross(v_original, v_target)
     rotation_axis_norm = to.norm(rotation_axis)
-    
+
     # If vectors are nearly parallel, choose a perpendicular axis
     if rotation_axis_norm < 1e-6:
         # Check if they're nearly the same or opposite
@@ -1658,29 +1846,34 @@ def create_complete_rotation(v_original, v_target):
             # Nearly opposite, rotate 180° around perpendicular axis
             # Find a consistent perpendicular axis
             if abs(v_original[0]) < abs(v_original[1]):
-                rotation_axis = to.tensor([1.0, 0.0, 0.0], device=v_original.device)
+                rotation_axis = to.tensor(
+                    [1.0, 0.0, 0.0], device=v_original.device)
             else:
-                rotation_axis = to.tensor([0.0, 1.0, 0.0], device=v_original.device)
-            rotation_axis = rotation_axis - to.dot(rotation_axis, v_original) * v_original
+                rotation_axis = to.tensor(
+                    [0.0, 1.0, 0.0], device=v_original.device)
+            rotation_axis = (
+                rotation_axis - to.dot(rotation_axis, v_original) * v_original
+            )
             rotation_axis = rotation_axis / to.norm(rotation_axis)
-            
+
     else:
         rotation_axis = rotation_axis / rotation_axis_norm
-    
+
     # Compute rotation angle
     cos_angle = to.clamp(to.dot(v_original, v_target), -1.0, 1.0)
     angle = to.acos(cos_angle)
-    
+
     # Build rotation matrix using Rodrigues' formula
     K = skew_symmetric(rotation_axis)
-    R = to.eye(3, device=v_original.device) + \
-        to.sin(angle) * K + \
-        (1 - cos_angle) * (K @ K)
-    
+    R = (
+        to.eye(3, device=v_original.device)
+        + to.sin(angle) * K
+        + (1 - cos_angle) * (K @ K)
+    )
+
     return R
 
 
-from scipy.spatial.transform import Rotation
 def align_normal_with_scipy(old_normal, new_normal):
     """
     Compute the rotation matrix that aligns old_normal to new_normal using SciPy.
@@ -1696,14 +1889,16 @@ def align_normal_with_scipy(old_normal, new_normal):
     # Ensure the vectors are normalized
     old_normal = old_normal / (old_normal.norm() + 1e-8)
     new_normal = new_normal / (new_normal.norm() + 1e-8)
-    
+
     # Convert to numpy and reshape to (1,3) as align_vectors expects an array of vectors.
     old_np = old_normal.detach().cpu().numpy().reshape(1, 3)
     new_np = new_normal.detach().cpu().numpy().reshape(1, 3)
-    
+
     # align_vectors returns the rotation that aligns the source (old) to the target (new)
     rot, rmsd = Rotation.align_vectors(new_np, old_np)
     return rot, rmsd
+
+
 def plot_points(positions, colors=None, point_size=10):
     """
     Plot a set of 3D points using Vispy.
@@ -1720,44 +1915,66 @@ def plot_points(positions, colors=None, point_size=10):
     """
     from vispy import scene, app
     import numpy as np
-    
+
     # Convert to numpy if tensor
     if isinstance(positions, to.Tensor):
         positions = positions.detach().cpu().numpy()
-    
+
     # Default color (white) if none provided
     if colors is None:
         colors = (1.0, 1.0, 1.0, 1.0)  # White with full opacity
-    
+
     # Create visualization context
     canvas = scene.SceneCanvas(keys="interactive", show=True, bgcolor="black")
     view = canvas.central_widget.add_view()
     view.camera = scene.cameras.TurntableCamera(fov=45)
-    
+
     # Create scatter plot
     scatter = scene.visuals.Markers(parent=view.scene)
-    scatter.set_data(positions, edge_color=None, face_color=colors, size=point_size)
-    
+    scatter.set_data(positions, edge_color=None,
+                     face_color=colors, size=point_size)
+
     # Add axes for reference
     axis = scene.visuals.XYZAxis(parent=view.scene)
-    
+
     # Set view range
     view.camera.set_range()
-    
+
     # Return the canvas so it stays alive
     app.run()
-    
+
     return canvas
+
+
+def huber_loss(predictions, targets, delta=1.0):
+    """
+    Compute the Huber loss between predictions and targets.
+
+    Args:
+        predictions (torch.Tensor): The predicted values.
+        targets (torch.Tensor): The ground truth values.
+        delta (float): The point where the loss changes from quadratic to linear.
+
+    Returns:
+        torch.Tensor: The computed Huber loss.
+    """
+    error = predictions - targets
+    abs_error = to.abs(error)
+    quadratic = to.minimum(abs_error, to.tensor(delta, device=error.device))
+    linear = abs_error - quadratic
+    loss = 0.5 * quadratic**2 + delta * linear
+    return loss.mean()
+
 
 def rotate_bounding_box(box_min: to.Tensor, box_max: to.Tensor, rotation: Rotation):
     """
     Apply a SciPy rotation to a bounding box defined by box_min and box_max.
-    
+
     Args:
         box_min (torch.Tensor): Tensor of shape (3,) for the minimum corner.
         box_max (torch.Tensor): Tensor of shape (3,) for the maximum corner.
         rotation (Rotation): A SciPy Rotation object representing the rotation.
-        
+
     Returns:
         new_box_min (torch.Tensor): Tensor of shape (3,) for the new minimum corner.
         new_box_max (torch.Tensor): Tensor of shape (3,) for the new maximum corner.
@@ -1766,16 +1983,20 @@ def rotate_bounding_box(box_min: to.Tensor, box_max: to.Tensor, rotation: Rotati
     center = (box_min + box_max) / 2
 
     # Compute all 8 vertices of the bounding box.
-    vertices = to.tensor([
-        [box_min[0], box_min[1], box_min[2]],
-        [box_min[0], box_min[1], box_max[2]],
-        [box_min[0], box_max[1], box_min[2]],
-        [box_min[0], box_max[1], box_max[2]],
-        [box_max[0], box_min[1], box_min[2]],
-        [box_max[0], box_min[1], box_max[2]],
-        [box_max[0], box_max[1], box_min[2]],
-        [box_max[0], box_max[1], box_max[2]],
-    ], device=box_min.device, dtype=box_min.dtype)
+    vertices = to.tensor(
+        [
+            [box_min[0], box_min[1], box_min[2]],
+            [box_min[0], box_min[1], box_max[2]],
+            [box_min[0], box_max[1], box_min[2]],
+            [box_min[0], box_max[1], box_max[2]],
+            [box_max[0], box_min[1], box_min[2]],
+            [box_max[0], box_min[1], box_max[2]],
+            [box_max[0], box_max[1], box_min[2]],
+            [box_max[0], box_max[1], box_max[2]],
+        ],
+        device=box_min.device,
+        dtype=box_min.dtype,
+    )
 
     # Translate vertices so that rotation happens around the center.
     vertices_centered = vertices - center
@@ -1783,9 +2004,11 @@ def rotate_bounding_box(box_min: to.Tensor, box_max: to.Tensor, rotation: Rotati
     # Convert vertices to NumPy for applying the SciPy rotation.
     vertices_np = vertices_centered.detach().cpu().numpy()
     rotated_vertices_np = rotation.apply(vertices_np)
-    
+
     # Convert the rotated vertices back to a Torch tensor.
-    rotated_vertices = to.from_numpy(rotated_vertices_np).to(box_min.device, dtype=box_min.dtype)
+    rotated_vertices = to.from_numpy(rotated_vertices_np).to(
+        box_min.device, dtype=box_min.dtype
+    )
 
     # Translate the vertices back to the original coordinate space.
     rotated_vertices = rotated_vertices + center
@@ -1796,22 +2019,144 @@ def rotate_bounding_box(box_min: to.Tensor, box_max: to.Tensor, rotation: Rotati
     return new_box_min, new_box_max
 
 
+def get_new_t_values(t_values, ray_oris, weights, neighbour_indices):
+    time_step = 0.05
+    weighted_neighbours = to.sum(weights * t_values[neighbour_indices], dim=1)
+    diff_neighbours = t_values - weighted_neighbours
+    t_values -= diff_neighbours * time_step
+    print(t_values)
+    return t_values
+
+
+def great_circle_distance(points1, points2, radius=2.0):
+    # Normalize points to ensure they are on the unit sphere
+    points1_normalized = points1 / to.norm(points1, dim=1, keepdim=True)
+    points2_normalized = points2 / to.norm(points2, dim=1, keepdim=True)
+
+    # Compute the dot product between all pairs
+    # This gives the cosine of the angle between the points
+    cos_angle = to.matmul(points1_normalized,
+                          points2_normalized.transpose(0, 1))
+
+    # Clip values to avoid numerical issues
+    cos_angle = to.clamp(cos_angle, -1.0, 1.0)
+
+    # Convert to angle (in radians)
+    angle = to.acos(cos_angle)
+
+    # Convert angle to distance along great circle
+    distance = radius * angle
+
+    return distance
+
+
+def get_laplacian(ray_oris):
+    K = 16
+    distances = to.cdist(ray_oris, ray_oris)
+    neighbour_distances, neighbour_indices = to.topk(
+        distances, K, largest=False)
+    weights = to.exp(-((neighbour_distances) ** 2))
+    N = distances.shape[0]
+    W = to.zeros((N, N), device=device)
+    rows = to.arange(N).unsqueeze(-1).expand(-1, K)
+    W[rows, neighbour_indices] = weights
+    D = to.sum(W, dim=1)
+    L = to.diag(D) - W
+    return L
+
+
+class SphereSignalVisualize:
+    def __init__(self, t_values, ray_oris):
+        # Initialise canvas
+        self.canvas = scene.SceneCanvas(
+            keys="interactive", show=True, bgcolor="white")
+        self.view = self.canvas.central_widget.add_view()
+        self.view.camera = scene.TurntableCamera()
+        self.scatter = scene.visuals.Markers()
+        self.positions = ray_oris.numpy()
+        self.values = t_values.numpy()
+
+        colors = self.get_colours(self.values)
+        self.scatter.set_data(self.positions, face_color=colors)
+        self.view.add(self.scatter)
+
+        K = 15
+        distances = to.cdist(ray_oris, ray_oris)
+        neighbour_distances, neighbour_indices = to.topk(
+            distances, K, largest=False)
+        weights = to.exp(-((neighbour_distances) ** 2))
+        N = self.positions.shape[0]
+        W = to.zeros((N, N))
+        rows = to.arange(N).unsqueeze(-1).expand(-1, K)
+        W[rows, neighbour_indices] = weights
+        D = to.sum(W, dim=1)
+        L = to.diag(D) - W
+        I = to.eye(N)
+        self.A = I + 0.01 * L
+        self.A_sparse = sp.csr_matrix(self.A.cpu().numpy())
+        self.render()
+
+    def get_colours(self, values):
+        norm = Normalize(vmin=np.min(values), vmax=np.max(values))
+        normalized_values = norm(values)
+        cmap = plt.get_cmap("viridis")
+        colors = cmap(normalized_values)
+        return colors
+
+    def update(self):
+        new_values = spla.spsolve(self.A_sparse, self.values)
+        print(np.max(new_values - self.values))
+        self.values = new_values
+        self.render()
+
+    def render(self):
+        colors = self.get_colours(self.values)
+        self.scatter.set_data(self.positions, face_color=colors)
+
+        self.canvas.update()
+
 
 if __name__ == "__main__":
-    import matplotlib.cm as cm
-    model = GaussianParameters("chair.ply")
+    model = GaussianParameters("man.ply")
+    train_model(model)
 
-    '''
-    blended_t_tvals = model.project()
-    positions = model.ray_oris + model.ray_dirs * blended_t_tvals
-    residual = model.laplacian @ blended_t_tvals  # shape: [num_rays]
-    residual = residual.squeeze(-1)
-    residual_np = residual.detach().cpu().numpy()
-    norm_res = (residual_np - residual_np.min()) / (residual_np.max() - residual_np.min() + 1e-8)
-    colors = cm.viridis(norm_res)  # returns RGBA values in [0,1]
+    """
+    app.create()  # Create the VisPy app without blocking
+    vizzer = SphereSignalVisualize(
+        t_values.squeeze().detach().cpu(), ray_oris.detach().cpu()
+    )
+
+    while True:
+        app.process_events()  # Process events periodically
+        vizzer.update()
+        time.sleep(0.01)  # Small delay to avoid high CPU usageapp.run()
+
+    # plot_sphere_signal(t_values.detach().cpu(), ray_oris.detach().cpu())
+    """
+    """
+    # losses = compute_graph_laplacian_loss(ray_oris + model.project_2() * ray_dirs)
+
+    
+    positions = model.ray_oris + model.ray_dirs * model.project_2()
+    for i in range(300):
+        new_positions = implicit_backward_euler_laplacian_smooth(positions, 0.005, 16)
+     
+        positions = new_positions
+        print(to.sum(compute_graph_laplacian_loss(positions, 16)))
+  
+    print(positions)
+  
+    losses = to.ones(positions.shape[0])
+    residual_np = losses.detach().cpu().numpy()
+    scalar_residual = residual_np
+    norm_res = (scalar_residual - scalar_residual.min()) / (scalar_residual.max() - scalar_residual.min() + 1e-8).squeeze()
+    colors = cm.viridis(norm_res)
+
+
 
     colors = np.array(colors)
-    print(colors.shape) 
+
+
     # Ensure colors shape matches positions (N, 4)
     positions_np = positions.detach().cpu().numpy()
 
@@ -1823,9 +2168,9 @@ if __name__ == "__main__":
 
     raise Exception
     print(model.ray_oris.shape)
-    '''
-    # test_scenario(min_corners, max_corners, model.gaussian_model.normals, new_normals)
 
-    train_model(model=model, num_iterations=400)
+    # test_scenario(min_corners, max_corners, model.gaussian_model.normals, new_normals)
+    """
+    # train_model(model=model)
     # Get spatial grid parameters
-    # Call optimized projection function            
+    # Call optimized projection function
