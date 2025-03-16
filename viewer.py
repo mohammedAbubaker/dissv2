@@ -17,6 +17,7 @@ import pandas as pd
 from vispy import scene, app
 from tqdm import tqdm
 
+
 import matplotlib.pyplot as plt
 from blank import kernel_code
 
@@ -27,7 +28,7 @@ module = cp.RawModule(code=kernel_code)
 kernel = module.get_function("ray_aabb_intersect_top16")
 
 
-def generate_rays_from_points(points, radius, keep_percentage=0.95):
+def generate_rays_from_points(points, radius, keep_percentage=0.55):
     # Sample a subset of points if keep_percentage < 1.0
     num_points = points.shape[0]
     num_keep = int(num_points * keep_percentage)
@@ -41,13 +42,20 @@ def generate_rays_from_points(points, radius, keep_percentage=0.95):
     # Generate ray directions from the center to the selected points
     ray_dirs = selected_points - center
     ray_dirs = ray_dirs / to.norm(ray_dirs, dim=1, keepdim=True)
+    jitter_strength = 0.3
+    # Add some jitter to rays (noise to avoid perfect alignment)
+    jitter = (
+        to.rand_like(ray_dirs) - 0.5
+    ) * jitter_strength  # Uniform noise in range [-jitter_strength, jitter_strength]
+    ray_dirs += jitter
+    ray_dirs = ray_dirs / to.norm(ray_dirs, dim=1, keepdim=True)
 
     # Compute ray origins
     ray_oris = center + ray_dirs * radius
     return ray_oris, -1.0 * ray_dirs
 
 
-def generate_fibonacci_sphere_rays(center, radius, n, jitter_scale=0.4):
+def generate_fibonacci_sphere_rays(center, radius, n, jitter_scale=0.003):
     """
     Generate rays using Fibonacci sphere sampling with PyTorch vectorization.
     Adds random jitter to ray directions for more natural variation.
@@ -199,8 +207,7 @@ def compute_weighted_neighbors(ray_oris, depth_values, k=4):
     neighbor_positions = depth_values[topk_indices]
 
     # Compute weighted average of neighbor positions for each point
-    weighted_neighbors = to.sum(
-        weights.unsqueeze(-1) * neighbor_positions, dim=1)
+    weighted_neighbors = to.sum(weights.unsqueeze(-1) * neighbor_positions, dim=1)
 
     return (
         weighted_neighbors,
@@ -259,8 +266,7 @@ def compute_graph_laplacian_loss(ray_oris, t_vals, k=16):
     neighbor_positions = t_vals[topk_indices]
 
     # Compute weighted average of neighbor positions for each point
-    weighted_neighbors = to.sum(
-        weights.unsqueeze(-1) * neighbor_positions, dim=1)
+    weighted_neighbors = to.sum(weights.unsqueeze(-1) * neighbor_positions, dim=1)
     laplacian_diff = t_vals - weighted_neighbors
     l2_loss = to.sum(laplacian_diff**2)
     return l2_loss
@@ -271,7 +277,8 @@ def compute_weighted_neighbors(points):
     # Compute pairwise distances (assuming compute_pairwise_euclidean exists)
     distances = compute_pairwise_euclidean(points)  # shape: [N, N]
     # Get indices of 16 nearest neighbors for each point (ignoring self if needed)
-    get_top_16_distances, get_top_16_indices = distances.topk(16, dim=1, largest=False)
+    get_top_16_distances, get_top_16_indices = distances.topk(
+        16, dim=1, largest=False)
     # Compute weights inversely proportional to distance
     weights = 1 / (get_top_16_distances + 1e-4)
     # Normalize weights to sum to 1 for each point (L1 normalization)
@@ -397,12 +404,10 @@ class GaussianModel:
             device
         )
         self.scales_exp = to.exp(self.scales)
-        self.scales_d = to.eye(3)[None, :, :].to(
-            device) * (self.scales_exp)[:, :, None]
+        self.scales_d = to.eye(3)[None, :, :].to(device) * (self.scales_exp)[:, :, None]
         self.scales_d **= 2
         self.scales_i_d = (
-            to.eye(3)[None, :, :].to(device) *
-            (1 / self.scales_exp)[:, :, None]
+            to.eye(3)[None, :, :].to(device) * (1 / self.scales_exp)[:, :, None]
         )
         self.scales_i_d **= 2
         self.rotations_t = self.rotations.transpose(-1, -2)
@@ -410,8 +415,7 @@ class GaussianModel:
         self.covariances = self.rotations @ self.scales_d @ self.rotations_t
 
         min_indices = self.scales_exp.argmin(axis=1)
-        self.normals = self.rotations[to.arange(
-            self.n_gaussians), :, min_indices]
+        self.normals = self.rotations[to.arange(self.n_gaussians), :, min_indices]
         self.normals = self.normals / to.linalg.norm(self.normals)
         centroid = self.means.mean(dim=0)
         vectors_to_centroid = centroid - self.means
@@ -625,27 +629,21 @@ class GaussianParameters(nn.Module):
         super(GaussianParameters, self).__init__()
         self.gaussian_model = GaussianModel(path)
         self.means = nn.Parameter(self.gaussian_model.means)
-        self.normals = nn.Parameter(self.gaussian_model.normals)
+        self.normals = self.gaussian_model.normals
 
     def based_2(self):
         depth_values = self.project_2().squeeze()
-        predicted_depth_values = backward_euler_update(
-            self.ray_oris, depth_values, 0.1)
-        fidelity_loss = F.mse_loss(
-            predicted_depth_values.squeeze(), depth_values)
+        predicted_depth_values = backward_euler_update(self.ray_oris, depth_values, 0.1)
+        fidelity_loss = F.mse_loss(predicted_depth_values.squeeze(), depth_values)
         lambda_laplacian = 0.3
         # Laplacian smoothness loss
         laplacian_loss = compute_graph_laplacian_loss(self.ray_oris)
 
-        print("Laplacian loss", lambda_laplacian * laplacian_loss)
-        print("Fidelity loss", (1 - lambda_laplacian) * fidelity_loss)
         total_loss = (
-            lambda_laplacian * laplacian_loss +
-            (1 - lambda_laplacian) * fidelity_loss
+            lambda_laplacian * laplacian_loss + (1 - lambda_laplacian) * fidelity_loss
         )
         return (
-            lambda_laplacian * laplacian_loss +
-            (1 - lambda_laplacian) * fidelity_loss
+            lambda_laplacian * laplacian_loss + (1 - lambda_laplacian) * fidelity_loss
         )
 
     def forward(self):
@@ -672,8 +670,7 @@ class GaussianParameters(nn.Module):
         new_rotations = new_rotations.squeeze(0)
         """
         # Expand rotations to match the number of vertices (2)
-        rotation_expanded = self.gaussian_model.rotations.unsqueeze(
-            1)  # [N, 1, 3, 3]
+        rotation_expanded = self.gaussian_model.rotations.unsqueeze(1)  # [N, 1, 3, 3]
         # [N, 2, 3, 3]
 
         rotation_expanded = rotation_expanded.expand(-1, 2, -1, -1)
@@ -791,8 +788,7 @@ class GaussianParameters(nn.Module):
 
         # A ray intersects the box if t_max >= max(t_min, 0)
         # (i.e. the exit time is positive and occurs after the entry time).
-        intersects = (t_max >= to.maximum(
-            t_min, to.zeros_like(t_min))) & (t_max >= 0)
+        intersects = (t_max >= to.maximum(t_min, to.zeros_like(t_min))) & (t_max >= 0)
         return intersects
 
     def visualize_bounding_volumes_intersections(self):
@@ -880,8 +876,7 @@ class GaussianParameters(nn.Module):
                 # (reshape ray origins and directions for broadcasting)
                 responses, tvals = get_max_responses_and_tvals(
                     ray_oris_batch[:, None, :],
-                    self.means.unsqueeze(0).expand(
-                        ray_oris_batch.shape[0], -1, 3),
+                    self.means.unsqueeze(0).expand(ray_oris_batch.shape[0], -1, 3),
                     self.gaussian_model.covariances.unsqueeze(0).expand(
                         ray_oris_batch.shape[0], -1, 3, 3
                     ),
@@ -889,8 +884,7 @@ class GaussianParameters(nn.Module):
                     self.gaussian_model.opacities.unsqueeze(0).expand(
                         ray_oris_batch.shape[0], -1, 1
                     ),
-                    self.normals.unsqueeze(0).expand(
-                        ray_oris_batch.shape[0], -1, 3),
+                    self.normals.unsqueeze(0).expand(ray_oris_batch.shape[0], -1, 3),
                     self.gaussian_model.normals.unsqueeze(0).expand(
                         ray_oris_batch.shape[0], -1, 3
                     ),
@@ -908,8 +902,7 @@ class GaussianParameters(nn.Module):
                 shifted[:, 1:] = transmittance[:, :-1]
                 sorted_contribution = shifted - transmittance
                 norm_factor = to.sum(sorted_contribution, dim=1, keepdim=True)
-                sorted_contribution = sorted_contribution / \
-                    (norm_factor + 1e-8)
+                sorted_contribution = sorted_contribution / (norm_factor + 1e-8)
                 inv_idx = sorted_idx.argsort(dim=1)
                 contribution = sorted_contribution.gather(dim=1, index=inv_idx)
                 batch_blended_tvals = to.sum(contribution * tvals, dim=1)
@@ -935,8 +928,7 @@ class GaussianParameters(nn.Module):
                 shifted[:, 1:] = transmittance[:, :-1]
                 sorted_contribution = shifted - transmittance
                 norm_factor = to.sum(sorted_contribution, dim=1, keepdim=True)
-                sorted_contribution = sorted_contribution / \
-                    (norm_factor + 1e-8)
+                sorted_contribution = sorted_contribution / (norm_factor + 1e-8)
                 inv_idx = sorted_idx.argsort(dim=1)
                 contribution = sorted_contribution.gather(dim=1, index=inv_idx)
                 batch_blended_tvals = to.sum(contribution * tvals, dim=1)
@@ -1140,16 +1132,14 @@ class GaussianParameters(nn.Module):
         return d_new
 
     def based_loss(self):
-        ray_oris, ray_dirs = generate_rays_from_points(
-            self.gaussian_model.means, 2)
+        ray_oris, ray_dirs = generate_rays_from_points(self.gaussian_model.means, 2)
         self.ray_oris = ray_oris.to(device)
         self.ray_dirs = ray_dirs.to(device)
         self.num_rays = ray_oris.shape[0]
         return compute_graph_laplacian_loss(ray_oris, self.project_2())
 
     def harmonic_loss(self):
-        ray_oris, ray_dirs = generate_rays_from_points(
-            self.gaussian_model.means, 2)
+        ray_oris, ray_dirs = generate_rays_from_points(self.gaussian_model.means, 2)
         model.ray_oris = ray_oris.to(device)
         model.ray_dirs = ray_dirs.to(device)
         model.num_rays = ray_oris.shape[0]
@@ -1196,12 +1186,10 @@ class GaussianParameters(nn.Module):
 class RenderContext:
     def __init__(self, point_size=5, fov=45, distance=10):
         # Create a Vispy canvas with an interactive background.
-        self.canvas = scene.SceneCanvas(
-            keys="interactive", show=True, bgcolor="black")
+        self.canvas = scene.SceneCanvas(keys="interactive", show=True, bgcolor="black")
         self.view = self.canvas.central_widget.add_view()
         # Use a TurntableCamera for 3D interaction.
-        self.view.camera = scene.cameras.TurntableCamera(
-            fov=fov, distance=distance)
+        self.view.camera = scene.cameras.TurntableCamera(fov=fov, distance=distance)
         # Create a scatter visual to display points.
         self.scatter = scene.visuals.Markers(parent=self.view.scene)
         # Initialize with an empty dataset.
@@ -1246,8 +1234,7 @@ class RenderContext:
             )
 
         # Update scatter plot data.
-        self.scatter.set_data(
-            positions, face_color=colors, size=self.point_size)
+        self.scatter.set_data(positions, face_color=colors, size=self.point_size)
         self.canvas.update()
         # Process pending GUI events to refresh the display immediately.
         app.process_events()
@@ -1261,8 +1248,7 @@ def matrix_to_quaternion(rotation_matrices):
 
     cond1 = trace > 0
     cond2 = (rotation_matrices[:, 0, 0] > rotation_matrices[:, 1, 1]) & ~cond1
-    cond3 = (rotation_matrices[:, 1, 1] >
-             rotation_matrices[:, 2, 2]) & ~(cond1 | cond2)
+    cond3 = (rotation_matrices[:, 1, 1] > rotation_matrices[:, 2, 2]) & ~(cond1 | cond2)
     cond4 = ~(cond1 | cond2 | cond3)
 
     S = to.zeros_like(trace)
@@ -1367,11 +1353,9 @@ def rot_matrix_to_quaternions(R):
         q[w_large, 3] = (R[w_large, 1, 0] - R[w_large, 0, 1]) / S
 
     # Case x is largest
-    x_large = (~w_large) & (R[:, 0, 0] > R[:, 1, 1]) & (
-        R[:, 0, 0] > R[:, 2, 2])
+    x_large = (~w_large) & (R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2])
     if x_large.any():
-        S = to.sqrt(1.0 + R[x_large, 0, 0] -
-                    R[x_large, 1, 1] - R[x_large, 2, 2]) * 2
+        S = to.sqrt(1.0 + R[x_large, 0, 0] - R[x_large, 1, 1] - R[x_large, 2, 2]) * 2
         q[x_large, 0] = (R[x_large, 2, 1] - R[x_large, 1, 2]) / S
         q[x_large, 1] = 0.25 * S
         q[x_large, 2] = (R[x_large, 0, 1] + R[x_large, 1, 0]) / S
@@ -1380,8 +1364,7 @@ def rot_matrix_to_quaternions(R):
     # Case y is largest
     y_large = (~w_large) & (~x_large) & (R[:, 1, 1] > R[:, 2, 2])
     if y_large.any():
-        S = to.sqrt(1.0 + R[y_large, 1, 1] -
-                    R[y_large, 0, 0] - R[y_large, 2, 2]) * 2
+        S = to.sqrt(1.0 + R[y_large, 1, 1] - R[y_large, 0, 0] - R[y_large, 2, 2]) * 2
         q[y_large, 0] = (R[y_large, 0, 2] - R[y_large, 2, 0]) / S
         q[y_large, 1] = (R[y_large, 0, 1] + R[y_large, 1, 0]) / S
         q[y_large, 2] = 0.25 * S
@@ -1390,8 +1373,7 @@ def rot_matrix_to_quaternions(R):
     # Case z is largest
     z_large = ~(w_large | x_large | y_large)
     if z_large.any():
-        S = to.sqrt(1.0 + R[z_large, 2, 2] -
-                    R[z_large, 0, 0] - R[z_large, 1, 1]) * 2
+        S = to.sqrt(1.0 + R[z_large, 2, 2] - R[z_large, 0, 0] - R[z_large, 1, 1]) * 2
         q[z_large, 0] = (R[z_large, 1, 0] - R[z_large, 0, 1]) / S
         q[z_large, 1] = (R[z_large, 0, 2] + R[z_large, 2, 0]) / S
         q[z_large, 2] = (R[z_large, 1, 2] + R[z_large, 2, 1]) / S
@@ -1487,8 +1469,7 @@ def visualize_depth_updates(model, ray_oris, ray_dirs, update_interval=0.1):
 
 
 def start_visualization(model, ray_oris, ray_dirs, update_interval=0.2):
-    visualize_depth_updates(model, ray_oris, ray_dirs,
-                            update_interval=update_interval)
+    visualize_depth_updates(model, ray_oris, ray_dirs, update_interval=update_interval)
 
 
 def visualize_means_evolution(model, update_interval=0.2):
@@ -1524,47 +1505,47 @@ def visualize_means_evolution(model, update_interval=0.2):
     app.run()
 
 
-def train_model(model, num_iterations=200, lr=0.00003):
-    optimizer = to.optim.AdamW(model.parameters(), lr=lr, amsgrad=True)
-
-    # Start visualization in a separate thread - this could be interfering with the training
-    '''
-    thread = threading.Thread(
-        target=start_visualization, args=(model, ray_oris, ray_dirs, 0.2)
-    )
-    thread.daemon = True  # Make the thread daemon so it exits when main program does
-    losses = []
-    '''
-    n_of_rays = 7000
+def train_model(model, num_iterations=300, lr=3e-4):
+    n_of_rays = 5000
     radius = 2
 
-    sphere_centre = to.tensor([
-        to.mean(model.means[0]),
-        to.mean(model.means[1]),
-        to.mean(model.means[2])
-    ], device=device)
-
+    sphere_centre = to.tensor(
+        [to.mean(model.means[0]), to.mean(model.means[1]), to.mean(model.means[2])],
+        device=device,
+    )
+    """
+    # Start visualization in a separate thread - this could be interfering with the training
     sphere_params = (sphere_centre, radius, n_of_rays)
-    
-    previous_means = model.means.clone().detach()
-    for iteration in tqdm(range(num_iterations - 1)):
-        model.ray_oris, model.ray_dirs = generate_fibonacci_sphere_rays(*sphere_params)
-        optimizer.zero_grad()
+    model.ray_oris, model.ray_dirs = generate_rays_from_points(model.means, 3.0)
+    thread = threading.Thread(
+        target=start_visualization, args=(model, model.ray_oris, model.ray_dirs, 0.2)
+    )
+    thread.daemon = True  # Make the thread daemon so it exits when main program does
+    thread.start()
+    losses = []
+    """
+    model.ray_oris, model.ray_dirs = generate_rays_from_points(
+        model.means.detach().clone(), 3.0
+    )
+    optimizer = to.optim.AdamW([model.means, model.normals], lr=lr)
+    for iteration in tqdm(range(num_iterations)):
+        if not (iteration % 50):
+            model.ray_oris, model.ray_dirs = generate_rays_from_points(
+                model.means.detach().clone(), 3.0
+            )
         # Fix ray origins/directions once at the beginning
         features = model.project_2()
-        lap_loss = features.T @ get_laplacian(model.ray_oris)  @ features
-        mean_loss = to.sum((model.means - previous_means) ** 2)
-        previous_means = model.means.clone().detach()
-        loss = lap_loss + mean_loss
+        loss = features.T @ get_laplacian(model.ray_oris.detach().clone()) @ features
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-    save_optimized_gaussian_model(
-        model, output_path="out.ply")
+    save_optimized_gaussian_model(model, output_path="out.ply")
+
 
 def get_box_corners(mins, maxs):
     """
-    Compute the 8 corners of a 3D bounding box (vectorized version).
+    Compute t()he 8 corners of a 3D bounding box (vectorized version).
 
     Args:
         mins: (B, 3) tensor/array for minimum corner of the box.
@@ -1622,10 +1603,10 @@ def test_scenario(old_mins, old_maxs, old_normals, new_normals):
     # Select a single box for visualization.
     box_idx = to.argmax(old_maxs - old_mins)
     render_bounding_boxes(
-        old_corners[box_idx: box_idx + 1],
-        new_corners[box_idx: box_idx + 1],
-        old_normals[box_idx: box_idx + 1],
-        new_normals[box_idx: box_idx + 1],
+        old_corners[box_idx : box_idx + 1],
+        new_corners[box_idx : box_idx + 1],
+        old_normals[box_idx : box_idx + 1],
+        new_normals[box_idx : box_idx + 1],
     )
 
 
@@ -1737,8 +1718,7 @@ def get_soft_top_candidates(
     # Check if any boxes are invalid (min > max)
     invalid_boxes = (min_corners > max_corners).any(dim=1)
     if invalid_boxes.any():
-        print(
-            f"Warning: {invalid_boxes.sum().item()} invalid bounding boxes detected!")
+        print(f"Warning: {invalid_boxes.sum().item()} invalid bounding boxes detected!")
 
     safe_ray_dirs = to.where(
         ray_dirs_exp != 0, ray_dirs_exp, to.full_like(ray_dirs_exp, 1e-8)
@@ -1846,11 +1826,9 @@ def create_complete_rotation(v_original, v_target):
             # Nearly opposite, rotate 180° around perpendicular axis
             # Find a consistent perpendicular axis
             if abs(v_original[0]) < abs(v_original[1]):
-                rotation_axis = to.tensor(
-                    [1.0, 0.0, 0.0], device=v_original.device)
+                rotation_axis = to.tensor([1.0, 0.0, 0.0], device=v_original.device)
             else:
-                rotation_axis = to.tensor(
-                    [0.0, 1.0, 0.0], device=v_original.device)
+                rotation_axis = to.tensor([0.0, 1.0, 0.0], device=v_original.device)
             rotation_axis = (
                 rotation_axis - to.dot(rotation_axis, v_original) * v_original
             )
@@ -1931,8 +1909,7 @@ def plot_points(positions, colors=None, point_size=10):
 
     # Create scatter plot
     scatter = scene.visuals.Markers(parent=view.scene)
-    scatter.set_data(positions, edge_color=None,
-                     face_color=colors, size=point_size)
+    scatter.set_data(positions, edge_color=None, face_color=colors, size=point_size)
 
     # Add axes for reference
     axis = scene.visuals.XYZAxis(parent=view.scene)
@@ -2035,8 +2012,7 @@ def great_circle_distance(points1, points2, radius=2.0):
 
     # Compute the dot product between all pairs
     # This gives the cosine of the angle between the points
-    cos_angle = to.matmul(points1_normalized,
-                          points2_normalized.transpose(0, 1))
+    cos_angle = to.matmul(points1_normalized, points2_normalized.transpose(0, 1))
 
     # Clip values to avoid numerical issues
     cos_angle = to.clamp(cos_angle, -1.0, 1.0)
@@ -2052,10 +2028,9 @@ def great_circle_distance(points1, points2, radius=2.0):
 
 def get_laplacian(ray_oris):
     K = 16
-    distances = to.cdist(ray_oris, ray_oris)
-    neighbour_distances, neighbour_indices = to.topk(
-        distances, K, largest=False)
-    weights = to.exp(-((neighbour_distances) ** 2))
+    distances = compute_pairwise_great_circle(ray_oris, 3.0)
+    neighbour_distances, neighbour_indices = to.topk(distances, K, largest=False)
+    weights = to.exp(-(neighbour_distances**2 * 3.9))
     N = distances.shape[0]
     W = to.zeros((N, N), device=device)
     rows = to.arange(N).unsqueeze(-1).expand(-1, K)
@@ -2066,25 +2041,25 @@ def get_laplacian(ray_oris):
 
 
 class SphereSignalVisualize:
-    def __init__(self, t_values, ray_oris):
+    def __init__(self, t_values, ray_oris, ray_dirs):
         # Initialise canvas
-        self.canvas = scene.SceneCanvas(
-            keys="interactive", show=True, bgcolor="white")
+        self.canvas = scene.SceneCanvas(keys="interactive", show=True, bgcolor="white")
         self.view = self.canvas.central_widget.add_view()
         self.view.camera = scene.TurntableCamera()
         self.scatter = scene.visuals.Markers()
-        self.positions = ray_oris.numpy()
+        self.ray_oris = ray_oris.numpy()
+        self.ray_dirs = ray_dirs.numpy()
         self.values = t_values.numpy()
+        self.positions = self.ray_oris + self.values[..., None] * self.ray_dirs
 
         colors = self.get_colours(self.values)
         self.scatter.set_data(self.positions, face_color=colors)
         self.view.add(self.scatter)
 
-        K = 15
-        distances = to.cdist(ray_oris, ray_oris)
-        neighbour_distances, neighbour_indices = to.topk(
-            distances, K, largest=False)
-        weights = to.exp(-((neighbour_distances) ** 2))
+        K = 16
+        distances = compute_pairwise_great_circle(ray_oris, 3)
+        neighbour_distances, neighbour_indices = to.topk(distances, K, largest=False)
+        weights = to.exp(-((neighbour_distances * 3.9) ** 2))
         N = self.positions.shape[0]
         W = to.zeros((N, N))
         rows = to.arange(N).unsqueeze(-1).expand(-1, K)
@@ -2093,6 +2068,7 @@ class SphereSignalVisualize:
         L = to.diag(D) - W
         I = to.eye(N)
         self.A = I + 0.01 * L
+        self.laplacian = L
         self.A_sparse = sp.csr_matrix(self.A.cpu().numpy())
         self.render()
 
@@ -2105,8 +2081,8 @@ class SphereSignalVisualize:
 
     def update(self):
         new_values = spla.spsolve(self.A_sparse, self.values)
-        print(np.max(new_values - self.values))
         self.values = new_values
+        self.positions = self.ray_oris + self.values[..., None] * self.ray_dirs
         self.render()
 
     def render(self):
@@ -2117,13 +2093,26 @@ class SphereSignalVisualize:
 
 
 if __name__ == "__main__":
-    model = GaussianParameters("man.ply")
+    model = GaussianParameters("car.ply")
     train_model(model)
+    raise Exception
+    n_of_rays = 5000
+    radius = 3
 
-    """
+    sphere_centre = to.tensor(
+        [to.mean(model.means[0]), to.mean(model.means[1]), to.mean(model.means[2])],
+        device=device,
+    )
+
+    sphere_params = (sphere_centre, radius, n_of_rays)
+    # model.ray_oris, model.ray_dirs = generate_fibonacci_sphere_rays(*sphere_params)
+    model.ray_oris, model.ray_dirs = generate_rays_from_points(model.means, radius)
+    t_values = model.project_2()
     app.create()  # Create the VisPy app without blocking
     vizzer = SphereSignalVisualize(
-        t_values.squeeze().detach().cpu(), ray_oris.detach().cpu()
+        t_values.squeeze().detach().cpu(),
+        model.ray_oris.detach().cpu(),
+        model.ray_dirs.detach().cpu(),
     )
 
     while True:
@@ -2132,24 +2121,24 @@ if __name__ == "__main__":
         time.sleep(0.01)  # Small delay to avoid high CPU usageapp.run()
 
     # plot_sphere_signal(t_values.detach().cpu(), ray_oris.detach().cpu())
-    """
-    """
     # losses = compute_graph_laplacian_loss(ray_oris + model.project_2() * ray_dirs)
 
-    
+    """
     positions = model.ray_oris + model.ray_dirs * model.project_2()
     for i in range(300):
-        new_positions = implicit_backward_euler_laplacian_smooth(positions, 0.005, 16)
-     
+        new_positions = implicit_backward_euler_laplacian_smooth(
+            positions, 0.005, 16)
+
         positions = new_positions
         print(to.sum(compute_graph_laplacian_loss(positions, 16)))
-  
+
     print(positions)
-  
+
     losses = to.ones(positions.shape[0])
     residual_np = losses.detach().cpu().numpy()
     scalar_residual = residual_np
-    norm_res = (scalar_residual - scalar_residual.min()) / (scalar_residual.max() - scalar_residual.min() + 1e-8).squeeze()
+    norm_res = (scalar_residual - scalar_residual.min()) / \
+                (scalar_residual.max() - scalar_residual.min() + 1e-8).squeeze()
     colors = cm.viridis(norm_res)
 
 
@@ -2162,15 +2151,18 @@ if __name__ == "__main__":
 
     # Create your render context and update scatter data
     context = RenderContext(point_size=7)
-    context.scatter.set_data(positions_np, face_color=colors, size=context.point_size)
+    context.scatter.set_data(
+        positions_np, face_color=colors, size=context.point_size)
     app.run()
     # Shape match visualisation
 
     raise Exception
     print(model.ray_oris.shape)
 
-    # test_scenario(min_corners, max_corners, model.gaussian_model.normals, new_normals)
+
     """
+
+    # test_scenario(min_corners, max_corners, model.gaussian_model.normals, new_normals)
     # train_model(model=model)
     # Get spatial grid parameters
-    # Call optimized projection function
+    # Call optimized projection functi
