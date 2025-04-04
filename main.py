@@ -1,11 +1,14 @@
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 import torch
-
+import faiss
 import os
 import glob
 import gc
 import math
 
 from plyfile import PlyData, PlyElement
+from scipy.spatial import KDTree
 
 # from torch.utils.checkpoint import checkpoint
 import pandas as pd
@@ -17,18 +20,16 @@ import numpy as np
 import torch as to
 # import threading
 
-from torch_kdtree import build_kd_tree
 
 device = "cuda"
 N = None
 input_opacities = None
 L = None
 A_sparse = None
-df = None
+
 
 gc.collect()
 to.cuda.empty_cache()
-# --- Logging and Saving ---
 
 
 def evaluate_gaussian_density_at_points(points, means, inv_covs, opacities):
@@ -78,214 +79,7 @@ def evaluate_gaussian_density_at_points(points, means, inv_covs, opacities):
     return evaluations
 
 
-def nerf_style_render_rays(
-    ray_oris_batch,
-    ray_dirs_batch,  # (batch_R, 3)
-    means,
-    inv_covs,
-    opacities,  # Gaussian params (means req grad)
-    n_samples,  # Number of samples per ray
-    tn,
-    tf,  # Near and far bounds
-    perturb=True,  # Use stratified sampling if True
-):
-    """
-    Performs NeRF-style volumetric rendering for a batch of rays using Gaussian densities.
-
-    Args: See above.
-
-    Returns:
-        torch.Tensor: Expected depth for each ray (batch_R,).
-    """
-    batch_R = ray_oris_batch.shape[0]
-    if batch_R == 0:
-        return torch.empty(0, device=ray_oris_batch.device)
-
-    # 1. Sample points along rays
-    t_vals = torch.linspace(0.0, 1.0, n_samples, device=device)  # (n_samples,)
-    depth_vals = (
-        tn * (1.0 - t_vals) + tf * t_vals
-    )  # Linearly space in depth (n_samples,)
-
-    if perturb:
-        # Stratified sampling: add random offset within each interval
-        mids = 0.5 * (depth_vals[1:] + depth_vals[:-1])
-        upper = torch.cat([mids, depth_vals[-1:]], -1)
-        lower = torch.cat([depth_vals[:1], mids], -1)
-        # (batch_R, n_samples)
-        t_rand = torch.rand(batch_R, n_samples, device=device)
-        depth_vals = (
-            lower.unsqueeze(0) + (upper - lower).unsqueeze(0) * t_rand
-        )  # (batch_R, n_samples)
-    else:
-        depth_vals = depth_vals.unsqueeze(0).expand(
-            batch_R, -1)  # (batch_R, n_samples)
-
-    # Calculate sample points in 3D: (batch_R, n_samples, 3)
-    # ro shape: (batch_R, 1, 3)
-    # depth_vals shape: (batch_R, n_samples, 1)
-    # rd shape: (batch_R, 1, 3)
-    sample_points = ray_oris_batch.unsqueeze(1) + depth_vals.unsqueeze(
-        -1
-    ) * ray_dirs_batch.unsqueeze(1)
-
-    # Reshape for density evaluation: (batch_R * n_samples, 3)
-    sample_points_flat = sample_points.view(-1, 3)
-
-    # 2. Evaluate density at sample points
-    # means: (1, N, 3), inv_covs: (1, N, 3, 3), opacities: (1, N, 1)
-    # Densities shape: (batch_R * n_samples, N)
-    densities_flat = evaluate_gaussian_density_at_points(
-        sample_points_flat,
-        means.unsqueeze(0),  # Add batch dim for broadcasting
-        inv_covs.unsqueeze(0),  # Add batch dim for broadcasting
-        opacities.unsqueeze(0),  # Add batch dim for broadcasting
-    )
-
-    # Sum density contributions from all Gaussians for each point
-    # sigma_flat shape: (batch_R * n_samples,)
-    sigma_flat = torch.sum(densities_flat, dim=-1)
-    # Add a small amount of noise or minimum density? Optional.
-    # sigma_flat = torch.relu(sigma_flat) # Ensure non-negative
-
-    # Reshape sigma back: (batch_R, n_samples)
-    sigma = sigma_flat.view(batch_R, n_samples)
-
-    # 3. Volumetric Integration (Numerical Quadrature)
-    # Calculate distances between adjacent samples
-    deltas = depth_vals[:, 1:] - depth_vals[:, :-1]  # (batch_R, n_samples-1)
-    # Assume final segment extends infinitely or to a large value
-    delta_inf = torch.full_like(deltas[:, :1], 1e10)  # (batch_R, 1)
-    deltas = torch.cat([deltas, delta_inf], dim=-1)  # (batch_R, n_samples)
-
-    # Calculate alpha (opacity) for each segment
-    alpha = 1.0 - torch.exp(-sigma * deltas)  # (batch_R, n_samples)
-    alpha = torch.clamp(alpha, 0.0, 1.0)  # Ensure valid alpha
-
-    # Calculate transmittance T_i = product(1 - alpha_j + epsilon) for j < i
-    # Add epsilon for numerical stability during cumprod backward pass
-    transmittance = torch.cumprod(1.0 - alpha + 1e-10, dim=-1)
-    # Shift transmittance: T_0=1, T_1=(1-a0), T_2=(1-a0)(1-a1), ...
-    transmittance = torch.cat(
-        [torch.ones(batch_R, 1, device=device), transmittance[:, :-1]], dim=-1
-    )  # (batch_R, n_samples)
-
-    # Calculate weights for each sample point
-    weights = transmittance * alpha  # (batch_R, n_samples)
-
-    # 4. Calculate Expected Depth
-    # Use midpoint depth values for integration accuracy
-    depth_vals_mid = 0.5 * (depth_vals[:, 1:] + depth_vals[:, :-1])
-    depth_vals_mid = torch.cat(
-        [depth_vals[:, :1], depth_vals_mid], dim=-1
-    )  # Add first depth
-
-    expected_depth = torch.sum(weights * depth_vals_mid, dim=-1)  # (batch_R,)
-
-    # Add contribution from background if needed (e.g., if ray doesn't hit anything)
-    # weight_background = transmittance[:, -1]
-    # expected_depth += weight_background * tf # Or some other background depth
-
-    return expected_depth  # (batch_R,)
-
-
-def surface_laplacian_criterion(points_on_surface, k=8, chunk_size=2048):
-    """
-    Computes Laplacian smoothing loss directly on a set of 3D points.
-
-    Args:
-        points_on_surface (torch.Tensor): Tensor of shape (N, 3) representing points in 3D space.
-        k (int): Number of nearest neighbors to consider for smoothing.
-        chunk_size (int): Chunk size for KNN calculation.
-
-    Returns:
-        torch.Tensor: Scalar loss value.
-    """
-    if points_on_surface.shape[0] < k + 1:
-        print(
-            f"Warning: Not enough points ({points_on_surface.shape[0]}) for k={k}. Skipping loss."
-        )
-        return to.tensor(
-            0.0, device=points_on_surface.device, requires_grad=True
-        )  # Return zero loss but keep grad
-
-    # Find k nearest neighbors in 3D space for each point
-    # Note: Using points_on_surface for both query and source
-    topk_distances, topk_indices = get_knn_distances_chunked(
-        points_on_surface.detach(),  # Use detach for KNN search if grads not needed here
-        points_on_surface.detach(),
-        k=k + 1,  # Find k+1 to include self
-        chunk_size=chunk_size,
-    )
-
-    # Exclude self (usually the closest point with distance 0)
-    topk_indices = topk_indices[:, 1:]  # Shape: (N, k)
-    # Optional: Use distances for weighting, similar to your original criterion
-    # topk_distances = topk_distances[:, 1:]
-    # weights = torch.exp(-(topk_distances**2)) # Example Gaussian weights
-    # weights = weights / weights.sum(dim=1, keepdim=True) # Normalize
-
-    # Gather the 3D positions of the neighbors
-    neighbor_positions = points_on_surface[topk_indices]  # Shape: (N, k, 3)
-
-    # Compute the average position of neighbors (simple average)
-    # avg_neighbor_position = torch.sum(weights.unsqueeze(-1) * neighbor_positions, dim=1) # Weighted average
-    avg_neighbor_position = to.mean(neighbor_positions, dim=1)  # Shape: (N, 3)
-
-    # Compute the squared difference (Laplacian vector)
-    laplacian_vector = points_on_surface - \
-        avg_neighbor_position  # Shape: (N, 3)
-
-    # Loss is the sum of squared magnitudes of the Laplacian vectors
-    # Using mean instead of sum can make it less sensitive to the number of points
-    loss = to.mean(to.sum(laplacian_vector**2, dim=1))
-    # Or using sum:
-    # loss = torch.sum(laplacian_vector**2)
-
-    return loss
-
-
-def get_knn_angular_chunked(query_points, source_points, k=16, chunk_size=1024):
-    """
-    Calculates distances to the k-nearest neighbors without computing the full distance matrix
-    by processing query points in chunks.
-
-    Args:
-        query_points (torch.Tensor): Points for which to find neighbors (shape: N, D).
-        source_points (torch.Tensor): Points to search neighbors from (shape: M, D).
-        k (int): Number of nearest neighbors to find.
-        chunk_size (int): Number of query points to process in each chunk.
-
-    Returns: (twrpk_distances, topk_indices) - Distances and indices of k-NN.
-               topk_distances: (N, k)
-               topk_indices: (N, k)  (indices are relative to source_points)
-    """
-    num_query_points = query_points.shape[0]
-    topk_distances = to.zeros(
-        (num_query_points, k), dtype=query_points.dtype, device=query_points.device
-    )
-    topk_indices = to.zeros(
-        (num_query_points, k), dtype=to.long, device=query_points.device
-    )
-    for start_idx in range(0, num_query_points, chunk_size):
-        end_idx = min(start_idx + chunk_size, num_query_points)
-        query_chunk = query_points[start_idx:end_idx]
-
-        distances = to.matmul(query_chunk, source_points.T)
-
-        # Find top k-nearest neighbors for each point in the chunk
-        chunk_topk_distances, chunk_topk_indices = to.topk(
-            distances, k=k, dim=1, largest=False
-        )
-        # chunk_topk_distances: (chunk_size, k)
-        # chunk_topk_indices:  (chunk_size, k) (indices are relative to source_points)
-
-        topk_distances[start_idx:end_idx, :] = chunk_topk_distances
-        topk_indices[start_idx:end_idx, :] = chunk_topk_indices
-    return topk_distances, topk_indices
-
-
-def compute_weighted_neighbors(ray_oris, depth_values, k=4):
+def compute_weighted_neighbors(ray_oris, depth_values, k=128):
     """
     Computes the weighted average of k-nearest neighbors for each point.
     Returns the weighted neighbor positions.
@@ -293,7 +87,7 @@ def compute_weighted_neighbors(ray_oris, depth_values, k=4):
 
     # Get k nearest neighbors
     topk_distances, topk_indices = get_knn_distances_chunked(
-        ray_oris.detach(), ray_oris.detach(), k=k, chunk_size=2048
+        ray_oris, ray_oris, k=k, chunk_size=2048
     )
 
     topk_distances = topk_distances[:, 1:]  # Remove first column
@@ -302,51 +96,59 @@ def compute_weighted_neighbors(ray_oris, depth_values, k=4):
     # Compute Gaussian weights and normalize
     weights = to.exp(-(topk_distances**2))
     weights = weights / weights.sum(dim=1, keepdim=True)
+    
 
     # Gather neighbor positions: shape (N, k, D)
     neighbor_positions = depth_values[topk_indices]  # Potential crash point
-
+     
     # Compute weighted average of neighbor positions for each point
-    weighted_neighbors = to.sum(
-        weights.unsqueeze(-1) * neighbor_positions, dim=1)
+    weighted_neighbors = to.sum(weights * neighbor_positions.squeeze(), dim=1)
 
     return (
-        weighted_neighbors,
+        weighted_neighbors.unsqueeze(-1),
         topk_indices,
         weights,
     )  # Return weight
 
 
-def compute_weighted_neighbors_3(ray_oris, depth_values, k=32):
+def find_tmin_tmax(ray_oris, ray_dirs, min_corners, max_corners):
     """
-    Computes the weighted average of k-nearest neighbors for each point.
-    Returns the weighted neighbor positions.
+    Calculates the tmin and tmax values for ray-box intersections.
+
+    Args:
+        ray_oris (to.Tensor): Ray origins with shape [R, 3]
+        ray_dirs (to.Tensor): Ray directions with shape [R, 3]
+        min_corners (to.Tensor): Minimum corners of bounding boxes with shape [B, 3]
+        max_corners (to.Tensor): Maximum corners of bounding boxes with shape [B, 3]
+
+    Returns:
+        tuple: (t_mins, t_maxs) where:
+            - t_mins: Entry intersection parameters with shape [R, B]
+            - t_maxs: Exit intersection parameters with shape [R, B]
     """
+    # Expand dimensions for broadcasting
+    ro_exp = ray_oris.unsqueeze(1)  # [R, 1, 3]
+    rd_exp = ray_dirs.unsqueeze(1)  # [R, 1, 3]
+    min_exp = min_corners.unsqueeze(0)  # [1, B, 3]
+    max_exp = max_corners.unsqueeze(0)  # [1, B, 3]
 
-    # Get k nearest neighbors
-    topk_distances, topk_indices = get_knn_angular_chunked(
-        ray_oris.detach(), ray_oris.detach(), k=k, chunk_size=2048
-    )
+    # Handle division by zero
+    safe_rd = to.where(rd_exp != 0, rd_exp, to.full_like(rd_exp, 1e-8))
+    inv_dirs = 1.0 / safe_rd  # [R, 1, 3]
 
-    topk_distances = topk_distances[:, 1:]  # Remove first column
-    topk_indices = topk_indices[:, 1:]  # Remove first column
+    # Compute t values for each corner
+    t1 = (min_exp - ro_exp) * inv_dirs  # [R, B, 3]
+    t2 = (max_exp - ro_exp) * inv_dirs  # [R, B, 3]
 
-    # Compute Gaussian weights and normalize
-    weights = to.exp(-(topk_distances**2))
-    weights = weights / weights.sum(dim=1, keepdim=True)
+    # Get entry and exit t values for each axis
+    t_min = to.minimum(t1, t2)  # [R, B, 3]
+    t_max = to.maximum(t1, t2)  # [R, B, 3]
 
-    # Gather neighbor positions: shape (N, k, D)
-    neighbor_positions = depth_values[topk_indices]  # Potential crash point
+    # Calculate overall entry and exit times
+    t_entry = to.max(t_min, dim=2)[0]  # [R, B]
+    t_exit = to.min(t_max, dim=2)[0]  # [R, B]
 
-    # Compute weighted average of neighbor positions for each point
-    weighted_neighbors = to.sum(
-        weights.unsqueeze(-1) * neighbor_positions, dim=1)
-
-    return (
-        weighted_neighbors,
-        topk_indices,
-        weights,
-    )  # Return weight
+    return t_entry, t_exit
 
 
 def compute_weighted_neighbors_2(positions, k=32):
@@ -383,7 +185,6 @@ def compute_weighted_neighbors_2(positions, k=32):
 
 
 def save_model(original_path, model, output_path="out.ply"):
-    global df
     original_ply = PlyData.read(original_path)
     original_data = original_ply["vertex"].data
 
@@ -394,6 +195,7 @@ def save_model(original_path, model, output_path="out.ply"):
     # new_quaternions = model["quaternions"]
     # new_scales = model["scales"]
 
+    df = pd.DataFrame(original_data)
     df["x"] = new_means[:, 0]
     df["y"] = new_means[:, 1]
     df["z"] = new_means[:, 2]
@@ -478,8 +280,8 @@ def sample_uniformly_from_boxes(min_corners, max_corners, num_samples):
 
     Returns:
         to.Tensor: Tensor of shape (num_samples, 3) containing sampled points.
-                   Returns an empty tensor if num_samples is 0 or if all boxes
-                   have zero volume.
+                Returns an empty tensor if num_samples is 0 or if all boxes
+                have zero volume.
     """
     if num_samples <= 0:
         return to.empty((0, 3), device=min_corners.device, dtype=min_corners.dtype)
@@ -551,40 +353,6 @@ def sample_uniformly_from_boxes(min_corners, max_corners, num_samples):
     return sampled_points
 
 
-def lol_diff(means, quaternions, scales):
-    n_gaussians = means.shape[0]
-    frequency_table = to.zeros(n_gaussians).to(device=device)
-    for i in range(10):
-        look_at = to.rand(3).to(device=device) - 0.5
-        normalised_look_at = look_at / to.norm(look_at)
-
-        ray_ori = normalised_look_at * 100
-        ray_dirs = means - ray_ori
-        ray_dirs = ray_dirs[to.randint(0, ray_dirs.shape[0], (10240,))]
-        ray_oris = to.broadcast_to(ray_ori, (ray_dirs.shape[0], 3))
-
-        indices = get_top_16_differentiable_batched(
-            means, scales, quaternions, ray_oris, ray_dirs, 1
-        )
-        frequency_table[indices] += 1
-
-    total = to.sum(frequency_table)
-    normalised_freq = frequency_table / total
-    sorted_values, sorted_indices = to.sort(normalised_freq, descending=True)
-    cumulative_sum = to.cumsum(sorted_values, dim=0)
-    threshold = 0.80
-    mask_below_threshold = cumulative_sum < threshold
-    original_indices = sorted_indices[mask_below_threshold]
-    min_corners, max_corners = create_bounding_boxes(
-        means[original_indices], scales[original_indices], quaternions[original_indices]
-    )
-
-    samples = sample_uniformly_from_boxes(
-        min_corners, max_corners, n_gaussians)
-
-    return samples
-
-
 def sample_v2(means, quaternions, scales, num_samples=2048):
     # Initialise a frequency table
     frequency_table = to.zeros(means.shape[0]).to(device=device)
@@ -637,7 +405,48 @@ def sample_v2(means, quaternions, scales, num_samples=2048):
     return samples[indices]
 
 
-def sample_v1(means, quaternions, scales, num_samples=1024):
+def find_intersecting_gaussians(
+    means, quaternions, scales, ray_oris, ray_dirs, batch_size=2048
+):
+    frequency_table = to.zeros(means.shape[0]).to(device=device)
+    for start_idx in range(0, ray_oris.shape[0], batch_size):
+        end_idx = min(start_idx + batch_size, ray_oris.shape[0])
+        ray_oris_batch = ray_oris[start_idx:end_idx]
+        ray_dirs_batch = ray_dirs[start_idx:end_idx]
+
+        # Add one to frequency table for each Gaussian that intersects with the ray
+        indices = get_top_16_differentiable_batched(
+            means, scales, quaternions, ray_oris_batch, ray_dirs_batch, 4
+        )
+        frequency_table[indices] += 1
+    return frequency_table > 0
+
+
+def sample_rays_from_bounding_volumes(means, quaternions, scales, num_samples):
+    centroid = to.mean(means, dim=0)
+    radius = 10
+    # Initialise bounding boxes
+    min_corners, max_corners = create_bounding_boxes(
+        means, scales, quaternions)
+    # Select num_samples bounding boxes
+    indices = to.randint(0, min_corners.shape[0], (num_samples,))
+    selected_min_corners = min_corners[indices]
+    selected_max_corners = max_corners[indices]
+    # Sample 1 point from each bounding box
+    random_facgtors = to.rand(num_samples, 3, device=device)
+    spans = selected_max_corners - selected_min_corners
+    points = selected_min_corners + random_facgtors * spans
+    ray_dirs = points - centroid
+    ray_dirs = ray_dirs / to.norm(ray_dirs, dim=1, keepdim=True)
+    ray_oris = centroid + ray_dirs * radius
+
+    return ray_oris, -1.0 * ray_dirs
+
+
+def samples_rays_from_splats(means, quaternions, scales, num_samples):
+    centroid = to.mean(means, dim=0)
+    radius = 10
+    # Sample points using Cholesky decomposition
     covariances = get_covariances(quaternions, scales)
     L = to.linalg.cholesky(covariances).to(device=device)
     samples_per_gaussian = 10
@@ -649,60 +458,11 @@ def sample_v1(means, quaternions, scales, num_samples=1024):
     samples += means.unsqueeze(1)
     samples = samples.reshape(-1, 3)
     indices = to.randint(0, samples.shape[0], (num_samples,))
-    ray_dirs = samples[indices]
+    points = samples[indices]
+    ray_dirs = points - centroid
     ray_dirs = ray_dirs / to.norm(ray_dirs, dim=1, keepdim=True)
-    ray_oris = ray_dirs * 10
+    ray_oris = centroid + ray_dirs * radius
     return ray_oris, -1.0 * ray_dirs
-
-
-def project_points_to_sphere(points, normals, sphere_center, sphere_radius):
-    """
-    Projects points along their normals until they intersect with the bounding sphere.
-
-    Args:()
-        points (torch.Tensor): Nx3 tensor of points.
-        normals (torch.Tensor): Nx3 tensor of normal vectors (assumed to be normalized).
-        sphere_center (torch.Tensor): 1x3 tensor representing the center of the sphere.
-        sphere_radius (float): Radius of the sphere.
-
-    Returns:
-        torch.Tensor: Nx3 tensor of intersection points on the sphere.
-    """
-    D = points - sphere_center  # Vector from sphere center to points
-    d_dot_n = to.sum(D * normals, dim=1)  # Dot product of D and normal
-    d_dot_d = to.sum(D * D, dim=1)  # Squared length of D
-
-    # Quadratic formula components
-    discriminant = d_dot_n**2 - (d_dot_d - sphere_radius**2)
-    sqrt_discriminant = to.sqrt(discriminant)
-
-    # Compute the two possible t values
-    t1 = -d_dot_n + sqrt_discriminant
-    t2 = -d_dot_n - sqrt_discriminant
-
-    # Choose the positive t (ensuring forward intersection)
-    t = to.where(t1 > 0, t1, t2)
-
-    # Compute intersection points on the sphere
-    intersection_points = points + t[:, None] * normals
-    return intersection_points
-
-
-def generate_rays_from_bounding_volume(points):
-    # Initialise a bounding volume
-    lower_corner_x = points[:, 0].min().unsqueeze(0)
-    lower_corner_y = points[:, 1].min().unsqueeze(0)
-    lower_corner_z = points[:, 2].min().unsqueeze(0)
-
-    upper_corner_x = points[:, 0].max().unsqueeze(0)
-    upper_corner_y = points[:, 1].max().unsqueeze(0)
-    upper_corner_z = points[:, 2].max().unsqueeze(0)
-
-    projected_points = points.clone()
-    projected_points[:, 1] = 2
-    inward_normal = to.tensor([0, -1.0, 0]).to(device=device).float()
-    inward_normal = inward_normal.unsqueeze(0).expand(points.shape[0], -1)
-    return projected_points, inward_normal
 
 
 def generate_rays_from_points(points):
@@ -714,9 +474,7 @@ def generate_rays_from_points(points):
     return ray_oris, -1.0 * ray_dirs
 
 
-def load_gaussians(path):
-    global N
-    global df
+def load_gaussians(path, df):
     plyfile = PlyData.read(path)
     # Load in data
     plyfile = PlyData.read(path)
@@ -733,9 +491,7 @@ def load_gaussians(path):
     means = to.tensor(df[means_mask].values).to(device)
     quaternions = to.tensor(df[quaternions_mask].values).to(device)
     scales = to.tensor(df[scales_mask].values).to(device)
-    N = means.shape[0]
 
-    global input_opacities
     input_opacities = to.tensor(df[opacities_mask].values).to(device)
 
     return {
@@ -775,76 +531,6 @@ def compute_laplacian(ray_oris, beta=3.9):
     # Compute Laplacian: L = d_0^T W d_0
     L = d_0.T @ weights @ d_0
     return L
-
-
-def get_laplacian(ray_oris):
-    K = 32
-    distances = to.cdist(ray_oris, ray_oris)
-    neighbour_distances, neighbour_indices = to.topk(
-        distances, K, largest=False)
-
-    weights = to.exp(-(neighbour_distances**2 * 1.0))  # Reduced scaling
-    N = distances.shape[0]
-    W = to.zeros((N, N), device=device)
-
-    rows = to.arange(N).unsqueeze(-1).expand(-1, K)
-    W[rows, neighbour_indices] = weights
-
-    D = to.sum(W, dim=1)
-    D_sqrt_inv = to.diag(1.0 / to.sqrt(D + 1e-6))  # Normalization
-
-    L = D_sqrt_inv @ (to.diag(D) - W) @ D_sqrt_inv
-    return L
-
-
-def get_laplacian_2(ray_oris):
-    K = 4
-    distances = to.cdist(ray_oris, ray_oris)
-    neighbour_distances, neighbour_indices = to.topk(
-        distances, K, largest=False)
-    weights = to.exp(-(neighbour_distances**2) * 0.001)
-    N = distances.shape[0]
-    W = to.zeros((N, N), device=device)
-    rows = to.arange(N).unsqueeze(-1).expand(-1, K)
-    W[rows, neighbour_indices] = weights
-    D = to.sum(W, dim=1)
-    L = to.diag(D) - W
-    return L
-
-
-def lq_get_rotation_matrices(quaternions):
-    # Normalise quaternions
-    quaternions_norm = quaternions / to.norm(quaternions, dim=1, keepdim=True)
-
-    x = quaternions_norm[:, 1]
-    y = quaternions_norm[:, 2]
-    z = quaternions_norm[:, 3]
-    w = quaternions_norm[:, 0]
-
-    xx = x * x
-    yy = y * y
-    zz = z * z
-    xy = x * y
-    xz = x * z
-    yz = y * z
-    xw = x * w
-    yw = y * w
-    zw = z * w
-
-    n = quaternions.shape[0]
-    R = to.empty((n, 3, 3), dtype=quaternions.dtype)
-
-    R[:, 0, 0] = 1 - 2 * (yy + zz)
-    R[:, 0, 1] = 2 * (xy - zw)
-    R[:, 0, 2] = 2 * (xz + yw)
-    R[:, 1, 0] = 2 * (xy + zw)
-    R[:, 1, 1] = 1 - 2 * (xx + zz)
-    R[:, 1, 2] = 2 * (yz - xw)
-    R[:, 2, 0] = 2 * (xz - yw)
-    R[:, 2, 1] = 2 * (yz + xw)
-    R[:, 2, 2] = 1 - 2 * (xx + yy)
-
-    return R
 
 
 def get_rotation_matrices(quaternions):
@@ -890,19 +576,6 @@ def get_scale_matrices(scales):
     return scales_d
 
 
-def lq_get_scale_matrices(scales):
-    # Scales are stored in log form, so exponentiate them.
-    scales_exp = to.exp(scales).to(device=device)
-    scales_d = to.eye(3)[None, ...].to(device) * (scales_exp)[..., None]
-    return scales_d
-
-
-def lq_get_covariances(params):
-    R = lq_get_rotation_matrices(params[:, 3:7]).to(device=device)
-    S = lq_get_scale_matrices(params[:, 7:10]).to(device=device)
-    return R @ S @ S @ R.transpose(-1, -2)
-
-
 def get_covariances(quaternions, scales):
     R = get_rotation_matrices(quaternions).to(device=device)
     S = get_scale_matrices(scales).to(device=device)
@@ -913,7 +586,6 @@ def get_covariances(quaternions, scales):
 
 
 def evaluate_points(positions, means, inv_covs, opacities):
-    # Pass opacity into sigmoid function
     distance_to_mean = positions - means
     exponent = -0.5 * (
         distance_to_mean[:, :, None,
@@ -1048,8 +720,6 @@ def get_max_responses_and_depths(ray_oris, means, inv_covs, ray_dirs, opacities)
 
 
 def cool_get_features(means, scales, quaternions, ray_oris, ray_dirs):
-    get_max_responses_v2(ray_oris, ray_dirs, means, scales, quaternions)
-    raise Exception
     covariances = get_covariances(quaternions, scales)
     # covariances += 1e-6 * to.eye(3).to(device=device)
     inv_covariances = to.linalg.inv(covariances)
@@ -1094,14 +764,14 @@ def cool_get_features(means, scales, quaternions, ray_oris, ray_dirs):
     return blended_tvals
 
 
-def serialise_params(means, quaternions, scales, path_out):
+def serialise_params(means, quaternions, scales, path_out, path_in):
     model = {
         "means": means,
         "quaternions": quaternions,
         "scales": scales,
     }
 
-    save_model(path, model, path_out)
+    save_model(path_in, model, path_out)
 
 
 def pack_model(model):
@@ -1225,6 +895,56 @@ def compute_global_features(
     return to.cat(f_list, dim=0)
 
 
+def sample_rays_bounding_sphere(means, num_samples=1024, radius_scale=1.5):
+    """Generates rays originating on a bounding sphere pointing towards the center."""
+    with torch.no_grad():
+        if means.shape[0] == 0:
+            return torch.empty((0, 3), device=means.device), torch.empty(
+                (0, 3), device=means.device
+            )
+
+        center = torch.mean(means, dim=0)
+        # Estimate object radius from means extent
+        max_dist_from_center = torch.max(
+            torch.linalg.norm(means - center, dim=1))
+        # Handle case where all means are at the center
+        if max_dist_from_center < 1e-6:
+            max_dist_from_center = 1.0  # Assign a default radius
+
+        sphere_radius = max_dist_from_center * radius_scale
+        if sphere_radius < 1e-6:  # Ensure radius is positive
+            sphere_radius = 1.0
+
+        # Generate points uniformly on sphere surface (using Fibonacci lattice is good)
+        indices = torch.arange(
+            0, num_samples, dtype=torch.float32, device=means.device)
+        phi = torch.acos(
+            1.0 - 2.0 * (indices + 0.5) / num_samples
+        )  # More uniform latitude
+        theta = math.pi * (1 + 5**0.5) * indices  # Golden angle longitude
+
+        x = torch.cos(theta) * torch.sin(phi)
+        y = torch.sin(theta) * torch.sin(phi)
+        z = torch.cos(phi)
+
+        # Combine, scale, and offset
+        unit_points = torch.stack([x, y, z], dim=1)  # [num_samples, 3]
+        ray_oris = center.unsqueeze(
+            0) + unit_points * sphere_radius  # [num_samples, 3]
+
+        # Directions point from origin towards center
+        target_point = center  # Simple target: center
+        ray_dirs = target_point.unsqueeze(0) - ray_oris  # [num_samples, 3]
+        ray_dirs = ray_dirs / torch.linalg.norm(
+            ray_dirs, dim=1, keepdim=True
+        )  # Normalize
+
+        print(
+            f"Generated rays from sphere: center={center.cpu().numpy()}, radius={sphere_radius:.3f}"
+        )
+        return ray_oris.detach(), ray_dirs.detach()
+
+
 def find_normals(means, quaternions, scales):
     # centroid
     centroid = to.mean(means, dim=0)
@@ -1262,54 +982,128 @@ def generate_rays(means, quaternions, scales, sample_size=1024):
     return ray_oris, ray_dirs
 
 
-class Model(to.nn.Module):
-    def __init__(self, means, quaternions, scales):
-        super().__init__()
-        self.means = to.nn.Parameter(means)
-        self.quaternions = quaternions
-        self.scales = scales
-        self.opacities = input_opacities
-        self.batch_size = 2048
-        self.normals = find_normals(means, quaternions, scales)
-        self.iter = 0
-        self.ray_oris, self.ray_dirs = sample_v1(
-            self.means,
-            self.quaternions,
-            self.scales,
-            self.means.shape[0],  # Sample N rays
+def evaluate_densities_gaussian(
+    samples,  # Shape: (R, S, 3)
+    means,  # Shape: (N, 3), requires_grad=True if optimizing means
+    inv_covs,  # Shape: (N, 3, 3), detached if not optimizing shape
+    # Shape: (N, 1), detached if not optimizing opacity (raw logits)
+    opacities,
+    gaussian_batch_size=128,  # How many Gaussians to process at once
+):
+    """
+    Evaluates the sum of density contributions from ALL N Gaussians
+    at each of the R*S sample points, batching over the N Gaussians
+    to control memory usage.
+
+    Args:
+        samples (torch.Tensor): Query points (R, S, 3).
+        means (torch.Tensor): Gaussian means (N, 3).
+        inv_covs (torch.Tensor): Inverse covariances (N, 3, 3).
+        opacities (torch.Tensor): Raw opacities (logits) (N, 1).
+        gaussian_batch_size (int): Number of Gaussians to process per batch.
+        device (str): Device to perform calculations on.
+
+    Returns:
+        torch.Tensor: Total density at each sample point (R, S).
+    """
+    R, S, _ = samples.shape
+    N = means.shape[0]
+
+    if N == 0:
+        return torch.zeros(R, S, device=device, dtype=samples.dtype)
+
+    total_density = torch.zeros(R, S, device=device, dtype=samples.dtype)
+
+    # Ensure samples are on the correct device
+    samples = samples.to(device)
+    # Expand samples for broadcasting against Gaussian chunks: (R, S, 1, 3)
+    samples_exp = samples.unsqueeze(2)
+
+    for i in range(0, N, gaussian_batch_size):
+        start_idx = i
+        end_idx = min(i + gaussian_batch_size, N)
+        current_n_chunk = end_idx - start_idx
+
+        # Select chunk of Gaussian parameters
+        means_chunk = means[start_idx:end_idx].to(device)  # (N_chunk, 3)
+        inv_covs_chunk = inv_covs[start_idx:end_idx].to(
+            device)  # (N_chunk, 3, 3)
+        opacities_chunk = opacities[start_idx:end_idx].to(
+            device)  # (N_chunk, 1)
+
+        # Expand chunk parameters for broadcasting against samples
+        # means_chunk_exp: (1, 1, N_chunk, 3)
+        means_chunk_exp = means_chunk.view(1, 1, current_n_chunk, 3)
+        # inv_covs_chunk_exp: (1, 1, N_chunk, 3, 3)
+        inv_covs_chunk_exp = inv_covs_chunk.view(1, 1, current_n_chunk, 3, 3)
+        # opacities_chunk_exp: (1, 1, N_chunk, 1)
+        opacities_chunk_exp = opacities_chunk.view(1, 1, current_n_chunk, 1)
+
+        # --- Perform calculation for this chunk ---
+        # Mahalanobis distance calculation
+        dist = samples_exp - means_chunk_exp  # (R, S, N_chunk, 3)
+        dist_vec = dist.unsqueeze(-2)  # (R, S, N_chunk, 1, 3)
+        dist_vec_T = dist.unsqueeze(-1)  # (R, S, N_chunk, 3, 1)
+
+        # mahal_sq: (R, S, N_chunk)
+        mahal_sq = (
+            torch.matmul(torch.matmul(
+                dist_vec, inv_covs_chunk_exp), dist_vec_T)
+            .squeeze(-1)
+            .squeeze(-1)
         )
+        mahal_sq = torch.clamp(mahal_sq, min=0.0)  # Stability
+
+        # Gaussian exponent
+        exponent = torch.exp(-0.5 * mahal_sq)  # (R, S, N_chunk)
+
+        # Sigmoid activation for opacity
+        # activated_opacities: (1, 1, N_chunk, 1)
+        activated_opacities = torch.sigmoid(opacities_chunk_exp)
+
+        # Density contribution for this chunk = opacity * exponent
+        # evaluations_chunk: (R, S, N_chunk)
+        evaluations_chunk = activated_opacities.squeeze(-1) * exponent
+
+        # --- Accumulate the sum of densities for this chunk ---
+        # Sum over N_chunk dimension
+        total_density += evaluations_chunk.sum(dim=2)
+
+        # Optional: Clear intermediate tensors if memory is extremely tight
+        del (
+            means_chunk,
+            inv_covs_chunk,
+            opacities_chunk,
+            means_chunk_exp,
+            inv_covs_chunk_exp,
+        )
+        del opacities_chunk_exp, dist, dist_vec, dist_vec_T, mahal_sq, exponent
+        del activated_opacities, evaluations_chunk
+        to.cuda.empty_cache()
+        gc.collect()
+    return total_density
+
+
+class Model(to.nn.Module):
+    def __init__(self, means, quaternions, scales, opacities):
+        super().__init__()
+        self.opacities = opacities
+        self.means = to.nn.Parameter(means)
+        self.quaternions = to.nn.Parameter(quaternions)
+        self.scales = to.nn.Parameter(scales)
+        # self.ray_oris, self.ray_dirs = generate_rays_from_points(self.means)
+
+        # self.ray_oris, self.ray_dirs = samples_rays_from_splats(self.means, self.quaternions, self.scales, 32_000)
+        self.ray_oris, self.ray_dirs = sample_rays_from_bounding_volumes(
+            self.means, self.quaternions, self.scales, 32_000
+        )
+        # self.ray_oris, self.ray_dirs = load_uniform_sphere("uniform_sphere.ply")
         self.ray_oris = self.ray_oris.detach()
         self.ray_dirs = self.ray_dirs.detach()
 
-    def forward(self):
-        # Build tree
-        kd_tree = build_kd_tree(self.means)
-        # Set up query points per ray
-        query_points_start = self.ray_oris
-        query_points_end = self.ray_oris + self.ray_dirs * 2
-        query_points = to.linspace(query_points_start, query_points_end, 10)
-        raise Exception
-
-    def forward_1(self):
-        covariances = get_covariances(self.quaternions, self.scales)
-        num_rays = self.ray_oris.shape[0]
-        inv_covs = to.linalg.inv(covariances)
-        features = []
-        for start_idx in range(0, num_rays, self.batch_size):
-            end_idx = min(start_idx + self.batch_size, num_rays)
-            features.append(
-                nerf_style_render_rays(
-                    self.ray_oris[start_idx:end_idx],
-                    self.ray_dirs[start_idx:end_idx],
-                    self.means,
-                    inv_covs,
-                    self.opacities,
-                    1,
-                    0,
-                    1,
-                )
-            )
-        return to.cat(features)
+        print(self.ray_oris.shape)
+        print(self.ray_dirs.shape)
+        self.batch_size = 256
 
     def forward_9(self):
         covariances = get_covariances(self.quaternions, self.scales)
@@ -1357,33 +1151,162 @@ class Model(to.nn.Module):
         return features
 
     def forward_6(self):
-        with to.no_grad():
-            self.ray_oris, self.ray_dirs = sample_v1(
-                self.means, self.quaternions, self.scales, self.means.shape[0]
-            )
+        return results
 
+    def forward_2(self):
+        # Use parameters defined in __init__
+        K = self.knn_k
+        S = self.num_samples_per_ray
+        inv_covs = self.all_inv_covs  # Use precomputed inverse covariances
+
+        # --- 1. Ray-Bounding Box Intersection ---
+        with torch.no_grad():  # BBox depends only on potentially updated means
+            min_corner = torch.min(self.means, dim=0)[0].unsqueeze(0)
+            max_corner = torch.max(self.means, dim=0)[0].unsqueeze(0)
+
+        t_min, t_max = find_tmin_tmax(
+            self.ray_oris, self.ray_dirs, min_corner, max_corner
+        )
+
+        t_vals = to.linspace(0, 1, S).to(device=device)  # Shape: [S]
+        z_vals = t_min + (t_max - t_min) * t_vals
+
+        print(self.ray_oris.shape)
+        print(z_vals.shape)
+        sample_points = self.ray_oris.unsqueeze(1) + self.ray_dirs.unsqueeze(
+            1
+        ) * z_vals.unsqueeze(-1)  # Shape: [R, S, 3]
+        # Each sample point is associated with a z val, lets set the z val as feature values
+        feature_values = z_vals
+        print(feature_values.shape)
+        features = []
+        for start_idx in tqdm(range(0, sample_points.shape[0], 10), desc="Finding KNN"):
+            end_idx = min(start_idx + self.knn_chunk_size,
+                          sample_points.shape[0])
+            batch_features = feature_values[start_idx:end_idx]  # Shape: [R, S]
+            # Get the batch of samples
+            batch_samples = sample_points[start_idx:end_idx]
+            query_points = batch_samples.view(-1, 3)
+            distances = to.cdist(query_points, self.means)  # Shape: [R*S, N]
+            # Get the top K nearest neighbors
+            knn_indices = to.topk(
+                distances, K, largest=False
+            ).indices  # Shape: [R*S, K]
+            knn_indices = knn_indices.view(-1, S, K)  # Reshape to [R, S, K]
+            # Find the corresponding means and opacities
+            knn_means = self.means[knn_indices]  # Shape: [R*S, K, 3]
+            knn_opacities = self.opacities[knn_indices]  # Shape: [R*S, K, 1]
+            # Shape: [R*S, K, 3, 3]
+            knn_inv_covs = self.all_inv_covs[knn_indices]
+            # Evaluate densities of the sample points
+            densities = evaluate_densities_knn(
+                batch_samples,
+                knn_means,
+                knn_inv_covs,
+                knn_opacities,
+            )
+            # Normalise densities
+            densities = densities / to.sum(densities, dim=1, keepdim=True)
+            next_sample_points = to.roll(batch_samples, shifts=-1, dims=1)
+            deltas = next_sample_points - batch_samples
+            # convert to distances
+            deltas = to.linalg.norm(deltas, dim=2)
+            transmittance = to.exp(-to.cumsum(deltas * densities, dim=1))
+
+            blended_feature = to.sum(
+                transmittance *
+                (1 - to.exp(-deltas * densities)) * batch_features,
+                dim=1,
+            )
+            print(blended_feature.shape)
+            features.append(blended_feature)
+
+        features = to.cat(features, dim=0)
+
+        return features
+
+    def forward_1(self):
+        covariances = get_covariances(self.quaternions, self.scales)
         num_rays = self.ray_oris.shape[0]
-        features = to.zeros(num_rays)
+        inv_covs = to.linalg.inv(covariances)
+        features = []
         for start_idx in range(0, num_rays, self.batch_size):
             end_idx = min(start_idx + self.batch_size, num_rays)
-            ray_oris_batch = self.ray_oris[start_idx:end_idx]
-            ray_dirs_batch = self.ray_dirs[start_idx:end_idx]
-            print_memory_stats("idx: " + str(start_idx))
+            features.append(
+                nerf_style_render_rays(
+                    self.ray_oris[start_idx:end_idx],
+                    self.ray_dirs[start_idx:end_idx],
+                    self.means,
+                    inv_covs,
+                    self.opacities,
+                    1,
+                    0,
+                    1,
+                )
+            )
+        return to.cat(features)
 
-            # Rename get_max_responses_v2
-            features_batch = get_max_responses_v2(
-                ray_oris_batch,
-                ray_dirs_batch,
+    def forward(self):
+        self.ray_oris, self.ray_dirs = sample_rays_from_bounding_volumes(
+            self.means, self.quaternions, self.scales, 32_000
+        )
+
+        covariances = get_covariances(self.quaternions, self.scales)
+        # Sample rays (keep this part)
+        num_rays = self.ray_oris.shape[0]
+        features = to.zeros(
+            num_rays, 1, device=self.means.device)  # Result tensor
+        k = 16
+        knn_indices = to.zeros(num_rays, k).to(device=device)
+        for start_idx in range(0, num_rays, self.batch_size):
+            end_idx = min(start_idx + self.batch_size, num_rays)
+
+            knn_indices_batch = get_top_16_differentiable_batched(
                 self.means,
                 self.scales,
                 self.quaternions,
-                self.opacities,
-            )
-            print_memory_stats("idx: " + str(start_idx))
+                self.ray_oris[start_idx:end_idx],
+                self.ray_dirs[start_idx:end_idx],
+                K=k,
+            )  # Shape: (num_rays, K)
 
-            features[start_idx:end_idx] = features_batch
+            knn_indices[start_idx:end_idx] = knn_indices_batch.long()
+
+        # --- Process Rays in Batches, using KNN results ---
+        for start_idx in range(0, num_rays, self.batch_size):
+            end_idx = min(start_idx + self.batch_size, num_rays)
+
+            # Get batches for rays and their corresponding KNN indices
+            ray_oris_batch = self.ray_oris[start_idx:end_idx]  # (batch_R, 3)
+            ray_dirs_batch = self.ray_dirs[start_idx:end_idx]  # (batch_R, 3)
+            knn_indices_batch = knn_indices[start_idx:end_idx]  # (batch_R, K)
+            batch_covariances = covariances[
+                knn_indices_batch.long()
+            ]  # (batch_R, K, 3, 3)
+            inv_covs = to.linalg.inv(batch_covariances)  # (batch_R, K, 3, 3)
+            max_responses, depths = get_max_responses_and_depths(
+                ray_oris_batch.unsqueeze(1),
+                self.means[knn_indices_batch.long()],
+                inv_covs,
+                ray_dirs_batch.unsqueeze(1),
+                self.opacities[knn_indices_batch.long()],
+            )
+
+            blended_features = blend_features(max_responses, depths, depths)
+            features[start_idx:end_idx] = blended_features
 
         return features
+
+    def forward_a(self):
+        self.ray_oris, self.ray_dirs = sample_v1(
+            self.means, self.quaternions, self.scales, self.means.shape[0]
+        )
+        covariances = get_covariances(self.quaternions, self.scales)
+        inv_covs = to.linalg.inv(covariances)
+        features = get_knn_gaussian_evals_chunked(
+            self.ray_oris, self.ray_dirs, self.means, inv_covs, self.opacities, 1024
+        )
+        return features.unsqueeze(1)
 
     def forward_3(self):
         samples = sample_v1(self.means, self.quaternions, self.scales)
@@ -1484,13 +1407,11 @@ def cool_train(means, quaternions, scales, ray_oris, ray_dirs):
         
         print(f"Epoch {epoch+1}, Loss: {epoch_loss}")
 """
-path = "chair.ply"
-model = load_gaussians(path)
 
 
 def load_uniform_sphere(
     ply_path,
-    n_of_rays=1024,
+    n_of_rays=15000,
     sphere_centre=to.tensor([0, 0, 0]).to(device=device),
     radius=1.0,
 ):
@@ -1511,13 +1432,13 @@ def sample_bbox_surface(bbox, n_samples):
     Samples points uniformly from the surface of a 3D axis-aligned bounding box.
 
     Parameters:
-      bbox: A numpy array of shape (2, 3) where bbox[0] is the minimum corner and
+    bbox: A numpy array of shape (2, 3) where bbox[0] is the minimum corner and
             bbox[1] is the maximum corner of the bounding box.
-      n_samples: Number of samples to generate.
+    n_samples: Number of samples to generate.
 
     Returns:
-      A numpy array of shape (n_samples, 3) containing points uniformly distributed
-      on the surface of the bounding box.
+    A numpy array of shape (n_samples, 3) containing points uniformly distributed
+    on the surface of the bounding box.
     """
     bbox = np.array(bbox)
     min_corner, max_corner = bbox[0], bbox[1]
@@ -1578,13 +1499,6 @@ def sample_bbox_surface(bbox, n_samples):
     return samples
 
 
-model = Model(
-    model["means"],
-    model["quaternions"],
-    model["scales"],
-)
-
-
 def sample_v3(means):
     new_ray_oris = []
 
@@ -1600,8 +1514,9 @@ def sample_v3(means):
 
 
 def criterion(f, positions):
-    weighted_neighbours, _, _ = compute_weighted_neighbors(positions, f)
-    return to.norm(to.sum((f - weighted_neighbours) ** 2, dim=1))
+    k = 2048
+    weighted_neighbours, _, _ = compute_weighted_neighbors(positions, f, k)
+    return to.sum((f - weighted_neighbours) ** 2) / k
 
 
 def criterion_3(positions):
@@ -1612,6 +1527,56 @@ def criterion_3(positions):
 def criterion_2(f, positions):
     weighted_neighbours, _, _ = compute_weighted_neighbors(positions, f)
     return to.sum((f - weighted_neighbours) ** 2)
+
+
+def get_knn_gaussian_evals_chunked(
+    ray_oris, ray_dirs, means, inv_covs, opacities, k=16, chunk_size=128
+):
+    """
+    Calculates distances to the k-nearest neighbors without computing the full distance matrix
+    by processing query points in chunks.
+
+    Args:
+        query_points (torch.Tensor): Points for which to find neighbors (shape: N, D).
+        source_points (torch.Tensor): Points to search neighbors from (shape: M, D).
+        k (int): Number of nearest neighbors to find.
+        chunk_size (int): Number of query points to process in each chunk.
+
+    Returns:
+        tuple: (topk_distances, topk_indices) - Distances and indices of k-NN.
+            topk_distances: (N, k)
+            topk_indices: (N, k)  (indices are relative to source_points)
+    """
+    num_query_points = ray_oris.shape[0]
+    chunk_size = 16
+    features = []
+
+    for start_idx in range(0, num_query_points, chunk_size):
+        end_idx = min(start_idx + chunk_size, num_query_points)
+        chunked_ray_oris = ray_oris[start_idx:end_idx]
+        chunked_ray_dirs = ray_dirs[start_idx:end_idx]
+
+        # Calculate distances only for the current chunk of query points to *all* source points
+        # Shape: (chunk_size, M)
+
+        distances = to.cdist(chunked_ray_oris, means)
+        # Find top k-nearest neighbors for each point in the chunk
+        _, indices = to.topk(distances, k=k, dim=1, largest=False)
+
+        max_responses, depths = get_max_responses_and_depths(
+            chunked_ray_oris.unsqueeze(1),
+            means[indices],
+            inv_covs[indices],
+            chunked_ray_dirs.unsqueeze(1),
+            opacities[indices],
+        )
+        depths = depths.squeeze()
+
+        max_responses_top = max_responses.squeeze()
+
+        features.append(blend_features(max_responses_top, depths, depths))
+    print("done")
+    return to.cat(features)
 
 
 def get_knn_distances_chunked(query_points, source_points, k=16, chunk_size=1024):
@@ -1627,8 +1592,8 @@ def get_knn_distances_chunked(query_points, source_points, k=16, chunk_size=1024
 
     Returns:
         tuple: (topk_distances, topk_indices) - Distances and indices of k-NN.
-               topk_distances: (N, k)
-               topk_indices: (N, k)  (indices are relative to source_points)
+            topk_distances: (N, k)
+            topk_indices: (N, k)  (indices are relative to source_points)
     """
     num_query_points = query_points.shape[0]
     topk_distances = to.zeros(
@@ -1901,17 +1866,43 @@ def serialise_with_intersection_info(model, output_path="intersection.ply"):
             )
 
 
-optimizer = to.optim.AdamW(model.parameters(), lr=5e-3, amsgrad=True)
-files = glob.glob("./out/*")
-for f in files:
-    os.remove(f)
+# models = ["airplane", "bed", "bench", "bookshelf", "bowl", "car", "chair"]
+models = ["airplane"]
 
+for m in models:
+    df = None
+    os.makedirs(f"out/{m}/", exist_ok=True)
 
-for epoch in range(5):
-    optimizer.zero_grad()
-    f = model()
-    loss = criterion(f, f)
-    loss.backward()
-    optimizer.step()
-    serialise_params(model.means, model.quaternions, model.scales, "pain.ply")
-    print("fuck")
+    path = f"models/{m}.ply"
+    model = load_gaussians(path, df)
+    model = Model(
+        model["means"], model["quaternions"], model["scales"], model["opacities"]
+    )
+    optimizer = to.optim.AdamW(model.parameters(), lr=1e-3)
+    files = glob.glob(f"./out/{m}/*")
+    for f in files:
+        os.remove(f)
+
+    for epoch in range(100):
+        optimizer.zero_grad()
+        f = model()
+
+        loss = criterion(f, model.ray_oris)
+
+        loss.backward()
+        optimizer.step()
+        """
+        grads = [p.grad.detach().cpu().numpy() for p in model.parameters() if p.grad is not None]
+        plt.hist(grads[0], bins=5)  # Plot histogram for first layer
+        plt.title("Gradient Distribution")
+        plt.show()'
+        """
+        if epoch % 10 == 0:
+            serialise_params(
+                model.means,
+                model.quaternions,
+                model.scales,
+                f"out/{m}/{epoch}.ply",
+                path,
+            )
+        print(f"Epoch {epoch}, Loss: {loss.item()}")
